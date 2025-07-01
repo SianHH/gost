@@ -6,6 +6,7 @@ import (
 	"github.com/go-gost/gost/extra/internal/bbr"
 	"github.com/go-gost/gost/extra/internal/brutal"
 	xnet "github.com/go-gost/gost/extra/internal/net"
+	"github.com/go-gost/gost/extra/internal/obfs"
 	"github.com/go-gost/gost/extra/internal/util"
 	quic_util "github.com/go-gost/gost/extra/internal/util/quic"
 	"net"
@@ -34,6 +35,8 @@ type quicListener struct {
 	logger  logger.Logger
 	md      metadata
 	options listener.Options
+
+	obfs *obfs.SalamanderObfuscator
 }
 
 func NewListener(opts ...listener.Option) listener.Listener {
@@ -50,6 +53,13 @@ func NewListener(opts ...listener.Option) listener.Listener {
 func (l *quicListener) Init(md md.Metadata) (err error) {
 	if err = l.parseMetadata(md); err != nil {
 		return
+	}
+
+	if l.md.obfs != "" {
+		l.obfs, err = obfs.NewSalamanderObfuscator([]byte(l.md.obfs))
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	addr := l.options.Addr
@@ -73,6 +83,10 @@ func (l *quicListener) Init(md md.Metadata) (err error) {
 	}
 	if l.md.cipherKey != nil {
 		conn = quic_util.CipherPacketConn(conn, l.md.cipherKey)
+	}
+	// 加密混淆
+	if l.obfs != nil {
+		conn = obfs.WrapPacketConn(conn, l.obfs)
 	}
 
 	conn = metrics.WrapPacketConn(l.options.Service, conn)

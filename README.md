@@ -14,6 +14,16 @@
 # 30mbps为客户端向服务端发送的最大速率
 ```
 
+可以使用obfs混淆流量特征
+```shell
+# 服务端
+./gost -L "relay+hy2://:11111?tx=100mbps&obfs=123123123"
+# 客户端
+./gost -L socks5://:1080 -F "relay+hy2://www.example.com:11111?tx=30mbps&obfs=123123123"
+
+# obfs参数长度最短为4,服务端和客户端必须使用相同的值才能正常连接
+```
+
 # GO Simple Tunnel
 
 ### GO语言实现的安全隧道

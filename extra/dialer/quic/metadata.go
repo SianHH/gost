@@ -14,7 +14,8 @@ type metadata struct {
 	maxStreams       int
 	enableDatagram   bool
 
-	tx string // 最大发送速率
+	tx   string // 最大发送速率
+	obfs string // 混淆
 
 	cipherKey []byte
 }
@@ -29,7 +30,8 @@ func (d *quicDialer) parseMetadata(md mdata.Metadata) (err error) {
 
 		cipherKey = "cipherKey"
 
-		tx = "tx"
+		tx   = "tx"
+		obfs = "obfs"
 	)
 
 	if key := mdutil.GetString(md, cipherKey); key != "" {
@@ -47,5 +49,6 @@ func (d *quicDialer) parseMetadata(md mdata.Metadata) (err error) {
 	d.md.maxStreams = mdutil.GetInt(md, maxStreams)
 	d.md.enableDatagram = mdutil.GetBool(md, "quic.enableDatagram", "enableDatagram")
 	d.md.tx = mdutil.GetString(md, tx)
+	d.md.obfs = mdutil.GetString(md, obfs)
 	return
 }

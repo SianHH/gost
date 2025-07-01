@@ -9,6 +9,7 @@ import (
 	md "github.com/go-gost/core/metadata"
 	"github.com/go-gost/gost/extra/internal/bbr"
 	"github.com/go-gost/gost/extra/internal/brutal"
+	"github.com/go-gost/gost/extra/internal/obfs"
 	"github.com/go-gost/gost/extra/internal/util"
 	quic_util "github.com/go-gost/gost/extra/internal/util/quic"
 	"github.com/go-gost/x/registry"
@@ -25,6 +26,8 @@ type quicDialer struct {
 	logger  logger.Logger
 	md      metadata
 	options dialer.Options
+
+	obfs *obfs.SalamanderObfuscator
 }
 
 func NewDialer(opts ...dialer.Option) dialer.Dialer {
@@ -45,6 +48,13 @@ func (d *quicDialer) Init(md md.Metadata) (err error) {
 		return
 	}
 
+	if d.md.obfs != "" {
+		d.obfs, err = obfs.NewSalamanderObfuscator([]byte(d.md.obfs))
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	return nil
 }
 
@@ -57,47 +67,6 @@ func (d *quicDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 	if err != nil {
 		return nil, err
 	}
-
-	//d.sessionMutex.Lock()
-	//defer d.sessionMutex.Unlock()
-	//
-	//session, ok := d.sessions[addr]
-	//if !ok {
-	//	options := &dialer.DialOptions{}
-	//	for _, opt := range opts {
-	//		opt(options)
-	//	}
-	//
-	//	c, err := options.Dialer.Dial(ctx, "udp", "")
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//	pc, ok := c.(net.PacketConn)
-	//	if !ok {
-	//		c.Close()
-	//		return nil, errors.New("quic: wrong connection type")
-	//	}
-	//	if d.md.cipherKey != nil {
-	//		pc = quic_util.CipherPacketConn(pc, d.md.cipherKey)
-	//	}
-	//
-	//	session, err = d.initSession(ctx, udpAddr, pc)
-	//	if err != nil {
-	//		d.logger.Error(err)
-	//		pc.Close()
-	//		return nil, err
-	//	}
-	//
-	//	d.sessions[addr] = session
-	//}
-	//
-	//conn, err = session.GetConn()
-	//if err != nil {
-	//	session.Close()
-	//	delete(d.sessions, addr)
-	//	return nil, err
-	//}
-	//return
 
 	options := &dialer.DialOptions{}
 	for _, opt := range opts {
@@ -115,6 +84,11 @@ func (d *quicDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 	}
 	if d.md.cipherKey != nil {
 		pc = quic_util.CipherPacketConn(pc, d.md.cipherKey)
+	}
+
+	// 添加混淆
+	if d.obfs != nil {
+		pc = obfs.WrapPacketConn(pc, d.obfs)
 	}
 
 	session, err := d.initSession(ctx, udpAddr, pc)

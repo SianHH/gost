@@ -22,7 +22,8 @@ type metadata struct {
 	cipherKey []byte
 	backlog   int
 
-	tx string
+	tx   string
+	obfs string
 }
 
 func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
@@ -36,6 +37,7 @@ func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
 		backlog   = "backlog"
 		cipherKey = "cipherKey"
 		tx        = "tx"
+		obfs      = "obfs"
 	)
 
 	l.md.backlog = mdutil.GetInt(md, backlog)
@@ -59,5 +61,6 @@ func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
 	l.md.enableDatagram = mdutil.GetBool(md, "quic.enableDatagram", "enableDatagram")
 
 	l.md.tx = mdutil.GetString(md, tx)
+	l.md.obfs = mdutil.GetString(md, obfs)
 	return
 }
