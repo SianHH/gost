@@ -155,7 +155,7 @@ func (l *quicListener) listenLoop() {
 		}
 
 		if l.md.tx > 0 {
-			congestion.UseBrutal(session, uint64(l.md.tx*1024*1024))
+			congestion.UseBrutal(session, uint64(l.md.tx*1024*1024/8))
 		} else {
 			congestion.UseBBR(session)
 		}

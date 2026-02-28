@@ -123,7 +123,7 @@ func (d *quicDialer) initSession(ctx context.Context, addr net.Addr, conn net.Pa
 		return nil, err
 	}
 	if d.md.tx > 0 {
-		congestion.UseBrutal(session, uint64(d.md.tx*1024*1024))
+		congestion.UseBrutal(session, uint64(d.md.tx*1024*1024/8))
 	} else {
 		congestion.UseBBR(session)
 	}
