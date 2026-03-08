@@ -2,13 +2,13 @@
 
 ```shell
 # UseBBR
-gost -L hy2://:8443
+gost -L quic://:8443
 
 # UseBrutal 10mbps
-gost -L hy2://:8443?tx=10
+gost -L quic://:8443?tx=10
 
 # UseBrutal 10mbps
-gost -L socks5://:1080 -F hy2://:8443?tx=10
+gost -L socks5://:1080 -F quic://127.0.0.1:8443?tx=10
 ```
 
 # GO Simple Tunnel

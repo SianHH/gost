@@ -1,4 +1,4 @@
-package quic
+package http3
 
 import (
 	"time"
@@ -12,21 +12,16 @@ const (
 )
 
 type metadata struct {
-	// keepAlive        bool
+	backlog int
+
+	// QUIC config options
 	keepAlivePeriod  time.Duration
-	handshakeTimeout time.Duration
 	maxIdleTimeout   time.Duration
+	handshakeTimeout time.Duration
 	maxStreams       int
-	enableDatagram   bool
-
-	cipherKey []byte
-	backlog   int
-
-	bbr bool
-	tx  int
 }
 
-func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
+func (l *http3Listener) parseMetadata(md mdata.Metadata) (err error) {
 	const (
 		keepAlive        = "keepAlive"
 		keepAlivePeriod  = "ttl"
@@ -34,19 +29,12 @@ func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
 		maxIdleTimeout   = "maxIdleTimeout"
 		maxStreams       = "maxStreams"
 
-		backlog   = "backlog"
-		cipherKey = "cipherKey"
-
-		tx = "tx"
+		backlog = "backlog"
 	)
 
 	l.md.backlog = mdutil.GetInt(md, backlog)
 	if l.md.backlog <= 0 {
 		l.md.backlog = defaultBacklog
-	}
-
-	if key := mdutil.GetString(md, cipherKey); key != "" {
-		l.md.cipherKey = []byte(key)
 	}
 
 	if mdutil.GetBool(md, keepAlive) {
@@ -58,8 +46,6 @@ func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
 	l.md.handshakeTimeout = mdutil.GetDuration(md, handshakeTimeout)
 	l.md.maxIdleTimeout = mdutil.GetDuration(md, maxIdleTimeout)
 	l.md.maxStreams = mdutil.GetInt(md, maxStreams)
-	l.md.enableDatagram = mdutil.GetBool(md, "quic.enableDatagram", "enableDatagram")
 
-	l.md.tx = mdutil.GetInt(md, tx)
 	return
 }

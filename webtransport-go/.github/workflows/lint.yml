@@ -1,0 +1,36 @@
+name: Lint
+permissions:
+  contents: read
+on: [push, pull_request]
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [ "1.24.x", "1.25.x" ]
+    runs-on: ubuntu-latest
+    name: Lint
+    env:
+      GOEXPERIMENT: ${{ matrix.go == '1.24.x' && 'synctest' || '' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Check for //go:build ignore in .go files
+        run: |
+          IGNORED_FILES=$(grep -rl '//go:build ignore' . --include='*.go') || true
+          if [ -n "$IGNORED_FILES" ]; then
+            echo "::error::Found ignored Go files: $IGNORED_FILES"
+            exit 1
+          fi
+      - name: Check that go.mod is tidied
+        if: success() || failure() # run this step even if the previous one failed
+        run: go mod tidy -diff
+      - name: golangci-lint
+        if: success() || failure() # run this step even if the previous one failed
+        uses: golangci/golangci-lint-action@v9
+        with:
+          args: --timeout=3m
+          version: v2.7.2

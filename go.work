@@ -4,5 +4,11 @@ use (
 	./gost
 	./gost-x
 	./quic-go
+	./webtransport-go
 )
 
+replace (
+	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22 => ./quic-go
+	github.com/go-gost/x v0.8.1 => ./gost-x
+	github.com/quic-go/webtransport-go v0.10.0 => ./webtransport-go
+)

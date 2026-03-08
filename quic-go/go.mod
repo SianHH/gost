@@ -2,11 +2,14 @@ module github.com/apernet/quic-go
 
 go 1.25.0
 
+replace github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22 => ../quic-go
+
 require (
 	github.com/quic-go/qpack v0.6.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/mock v0.6.0
 	golang.org/x/crypto v0.48.0
+	golang.org/x/exp v0.0.0-20241210194714-1829a127f884
 	golang.org/x/net v0.51.0
 	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.41.0

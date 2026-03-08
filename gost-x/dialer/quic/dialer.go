@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/congestions"
 	"github.com/go-gost/core/dialer"
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
@@ -120,6 +121,12 @@ func (d *quicDialer) initSession(ctx context.Context, addr net.Addr, conn net.Pa
 	session, err := quic.DialEarly(ctx, conn, addr, tlsCfg, quicConfig)
 	if err != nil {
 		return nil, err
+	}
+
+	if d.md.tx > 0 {
+		congestions.UseBrutal(session, uint64(d.md.tx*1024*1024/8))
+	} else {
+		congestions.UseBBR(session)
 	}
 	return &quicSession{session: session}, nil
 }

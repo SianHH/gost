@@ -1,4 +1,4 @@
-package quic
+package wt
 
 import (
 	"time"
@@ -8,45 +8,40 @@ import (
 )
 
 const (
+	defaultPath    = "/wt"
 	defaultBacklog = 128
 )
 
 type metadata struct {
-	// keepAlive        bool
+	path    string
+	backlog int
+
+	// QUIC config options
 	keepAlivePeriod  time.Duration
-	handshakeTimeout time.Duration
 	maxIdleTimeout   time.Duration
+	handshakeTimeout time.Duration
 	maxStreams       int
-	enableDatagram   bool
-
-	cipherKey []byte
-	backlog   int
-
-	bbr bool
-	tx  int
 }
 
-func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
+func (l *wtListener) parseMetadata(md mdata.Metadata) (err error) {
 	const (
-		keepAlive        = "keepAlive"
+		keepAlive        = "keepalive"
 		keepAlivePeriod  = "ttl"
 		handshakeTimeout = "handshakeTimeout"
 		maxIdleTimeout   = "maxIdleTimeout"
 		maxStreams       = "maxStreams"
 
-		backlog   = "backlog"
-		cipherKey = "cipherKey"
-
-		tx = "tx"
+		backlog = "backlog"
 	)
+
+	l.md.path = mdutil.GetString(md, "wt.path", "path")
+	if l.md.path == "" {
+		l.md.path = defaultPath
+	}
 
 	l.md.backlog = mdutil.GetInt(md, backlog)
 	if l.md.backlog <= 0 {
 		l.md.backlog = defaultBacklog
-	}
-
-	if key := mdutil.GetString(md, cipherKey); key != "" {
-		l.md.cipherKey = []byte(key)
 	}
 
 	if mdutil.GetBool(md, keepAlive) {
@@ -58,8 +53,6 @@ func (l *quicListener) parseMetadata(md mdata.Metadata) (err error) {
 	l.md.handshakeTimeout = mdutil.GetDuration(md, handshakeTimeout)
 	l.md.maxIdleTimeout = mdutil.GetDuration(md, maxIdleTimeout)
 	l.md.maxStreams = mdutil.GetInt(md, maxStreams)
-	l.md.enableDatagram = mdutil.GetBool(md, "quic.enableDatagram", "enableDatagram")
 
-	l.md.tx = mdutil.GetInt(md, tx)
 	return
 }

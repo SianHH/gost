@@ -1,0 +1,31 @@
+name: Interop
+permissions:
+  contents: read
+on: [push, pull_request]
+
+jobs:
+  interop:
+    runs-on: "ubuntu-latest"
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [ "1.24.x", "1.25.x" ]
+    steps:
+    - uses: actions/checkout@v6
+    - uses: nanasess/setup-chromedriver@v2
+      with:
+        chromedriver-version: '142.0.7444.162'
+    - uses: actions/setup-go@v6
+      with:
+        go-version: ${{ matrix.go }}
+    - name: Build interop server
+      run: go build -o interopserver interop/main.go
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+    - name: Install Python dependencies
+      run: pip install -r interop/requirements.txt
+    - name: Run interop tests
+      run: |
+        ./interopserver &
+        timeout 120 python interop/interop.py

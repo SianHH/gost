@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/congestions"
 	"github.com/go-gost/core/limiter"
 	"github.com/go-gost/core/listener"
 	"github.com/go-gost/core/logger"
@@ -151,6 +152,12 @@ func (l *quicListener) listenLoop() {
 			l.errChan <- err
 			close(l.errChan)
 			return
+		}
+
+		if l.md.tx > 0 {
+			congestions.UseBrutal(session, uint64(l.md.tx*1024*1024/8))
+		} else {
+			congestions.UseBBR(session)
 		}
 		go l.mux(ctx, session)
 	}

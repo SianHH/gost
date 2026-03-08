@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/congestions"
 	"github.com/apernet/quic-go/http3/qlog"
 	"github.com/apernet/quic-go/qlogwriter"
 	"github.com/apernet/quic-go/quicvarint"
@@ -284,6 +285,7 @@ func (s *Server) serveListener(ln QUICListener) error {
 		if err != nil {
 			return err
 		}
+		congestions.UseBBR(conn)
 		s.connCount.Add(1)
 		go func() {
 			defer s.decreaseConnCount()
