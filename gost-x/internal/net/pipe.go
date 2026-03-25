@@ -19,6 +19,14 @@ func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser) error {
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 
+	go func() {
+		<-ctx.Done()
+		_, _ = io.Copy(io.Discard, rw1)
+		_, _ = io.Copy(io.Discard, rw2)
+		_ = rw1.Close()
+		_ = rw2.Close()
+	}()
+
 	ch := make(chan error, 2)
 
 	go func() {
