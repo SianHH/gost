@@ -38,3 +38,5 @@ snap
 *.yaml
 *.txt
 dist/
+shared_object/arm64-v8a
+shared_object/x86_64
