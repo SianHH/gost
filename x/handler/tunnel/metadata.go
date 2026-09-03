@@ -1,0 +1,203 @@
+package tunnel
+
+import (
+	"encoding/json"
+	"strings"
+	"time"
+
+	"github.com/go-gost/core/ingress"
+	"github.com/go-gost/core/logger"
+	mdata "github.com/go-gost/core/metadata"
+	"github.com/go-gost/core/sd"
+	"github.com/go-gost/relay"
+	xingress "github.com/go-gost/x/ingress"
+	"github.com/go-gost/x/internal/util/mux"
+	mdutil "github.com/go-gost/x/metadata/util"
+	"github.com/go-gost/x/registry"
+)
+
+const (
+	// defaultTTL is the default time-to-live for a Tunnel's clean goroutine.
+	// Every tick removes closed connectors and renews SD registrations.
+	defaultTTL = 15 * time.Second
+)
+
+// metadata holds the parsed configuration for the tunnel handler.
+//
+// All fields are populated from the handler's metadata map in parseMetadata.
+// Most fields have matching "entrypoint.*" config keys.
+type metadata struct {
+	// readTimeout is the deadline for reading the initial relay protocol
+	// handshake from the client connection. The deadline is cleared
+	// after the handshake, so it does not affect subsequent data
+	// transfer. 0 or negative means no timeout is applied.
+	readTimeout time.Duration
+
+	// entrypoints holds additional entrypoint configurations from the
+	// "entrypoints" metadata key (JSON array of {Addr, Ingress}).
+	entrypoints []entrypointConfig
+
+	// entryPoint is the TCP address for the primary entrypoint listener
+	// (from the "entrypoint" metadata key).
+	entryPoint string
+	// entryPointID is the parsed tunnel ID that identifies public
+	// entrypoint visitors in handleConnect.
+	entryPointID            relay.TunnelID
+	entryPointProxyProtocol int
+	entryPointKeepalive     bool
+	entryPointCompression   bool
+	// entryPointReadTimeout is the deadline for reading upstream HTTP
+	// response headers in the entrypoint's http.Transport.ResponseHeaderTimeout.
+	// Also passed as readTimeout to the entrypoint dialer for SetReadDeadline
+	// on the upstream connection. 0 or negative defaults to 15s.
+	entryPointReadTimeout time.Duration
+	// sniffingWebsocket enables WebSocket frame-level recording in the
+	// entrypoint HTTP handler.
+	sniffingWebsocket bool
+	// sniffingWebsocketSampleRate controls the rate for WebSocket frame
+	// recording. 0 defaults to DefaultSampleRate.
+	sniffingWebsocketSampleRate float64
+
+	// directTunnel when true allows direct tunnel connections without
+	// ingress routing (the tunnel ID from the relay request is used directly).
+	directTunnel bool
+	// tunnelTTL is the TTL for the Tunnel's clean goroutine. Defaults to defaultTTL.
+	tunnelTTL time.Duration
+	ingress   ingress.Ingress
+	sd        sd.SD
+	muxCfg    *mux.Config
+
+	observerPeriod       time.Duration
+	observerResetTraffic bool
+
+	limiterRefreshInterval time.Duration
+	limiterCleanupInterval time.Duration
+}
+
+func (h *tunnelHandler) parseMetadata(md mdata.Metadata) (err error) {
+	h.md.readTimeout = mdutil.GetDuration(md, "readTimeout")
+
+	h.md.entryPoint = mdutil.GetString(md, "entrypoint")
+	h.md.entryPointID = ParseTunnelID(mdutil.GetString(md, "entrypoint.id"))
+	h.md.entryPointProxyProtocol = mdutil.GetInt(md, "entrypoint.ProxyProtocol")
+
+	h.md.entryPointKeepalive = mdutil.GetBool(md, "entrypoint.keepalive")
+	h.md.entryPointCompression = mdutil.GetBool(md, "entrypoint.compression")
+
+	h.md.entryPointReadTimeout = mdutil.GetDuration(md, "entrypoint.readTimeout")
+	if h.md.entryPointReadTimeout <= 0 {
+		h.md.entryPointReadTimeout = 15 * time.Second
+	}
+
+	h.md.sniffingWebsocket = mdutil.GetBool(md, "sniffing.websocket")
+	h.md.sniffingWebsocketSampleRate = mdutil.GetFloat(md, "sniffing.websocket.sampleRate")
+
+	h.md.tunnelTTL = mdutil.GetDuration(md, "tunnel.ttl")
+	if h.md.tunnelTTL <= 0 {
+		h.md.tunnelTTL = defaultTTL
+	}
+	h.md.directTunnel = mdutil.GetBool(md, "tunnel.direct")
+
+	h.md.ingress = registry.IngressRegistry().Get(mdutil.GetString(md, "ingress"))
+	if h.md.ingress == nil {
+		var rules []*ingress.Rule
+		for _, s := range strings.Split(mdutil.GetString(md, "tunnel"), ",") {
+			ss := strings.SplitN(s, ":", 2)
+			if len(ss) != 2 {
+				continue
+			}
+			rules = append(rules, &ingress.Rule{
+				Hostname: ss[0],
+				Endpoint: ss[1],
+			})
+		}
+		if len(rules) > 0 {
+			h.md.ingress = xingress.NewIngress(
+				xingress.RulesOption(rules),
+				xingress.LoggerOption(logger.Default().WithFields(map[string]any{
+					"kind":    "ingress",
+					"ingress": "@internal",
+				})),
+			)
+		}
+	}
+
+	if md != nil {
+		if v := md.Get("entrypoints"); v != nil {
+			b, err := json.Marshal(v)
+			if err != nil {
+				return err
+			}
+
+			var entrypoints []struct {
+				Addr    string
+				Ingress string
+			}
+
+			if err := json.Unmarshal(b, &entrypoints); err != nil {
+				return err
+			}
+
+			for _, ep := range entrypoints {
+				if ep.Addr == "" {
+					continue
+				}
+				ingress := registry.IngressRegistry().Get(ep.Ingress)
+				if ingress == nil {
+					ingress = h.md.ingress
+				}
+				h.md.entrypoints = append(h.md.entrypoints, entrypointConfig{
+					Addr:    ep.Addr,
+					Ingress: ingress,
+				})
+			}
+		}
+	}
+
+	h.md.sd = registry.SDRegistry().Get(mdutil.GetString(md, "sd"))
+
+	h.md.muxCfg = &mux.Config{
+		Version:           mdutil.GetInt(md, "mux.version"),
+		KeepAliveInterval: mdutil.GetDuration(md, "mux.keepaliveInterval"),
+		KeepAliveDisabled: mdutil.GetBool(md, "mux.keepaliveDisabled"),
+		KeepAliveTimeout:  mdutil.GetDuration(md, "mux.keepaliveTimeout"),
+		MaxFrameSize:      mdutil.GetInt(md, "mux.maxFrameSize"),
+		MaxReceiveBuffer:  mdutil.GetInt(md, "mux.maxReceiveBuffer"),
+		MaxStreamBuffer:   mdutil.GetInt(md, "mux.maxStreamBuffer"),
+		Type:              mdutil.GetString(md, "mux.type"),
+		MaxStreamWindow:   mdutil.GetInt(md, "mux.maxStreamWindow"),
+	}
+	if h.md.muxCfg.Version == 0 {
+		h.md.muxCfg.Version = 2
+	}
+	if h.md.muxCfg.MaxStreamBuffer == 0 {
+		h.md.muxCfg.MaxStreamBuffer = 1048576
+	}
+
+	h.md.observerPeriod = mdutil.GetDuration(md, "observePeriod", "observer.period", "observer.observePeriod")
+	if h.md.observerPeriod == 0 {
+		h.md.observerPeriod = 5 * time.Second
+	}
+	if h.md.observerPeriod < time.Second {
+		h.md.observerPeriod = time.Second
+	}
+	h.md.observerResetTraffic = mdutil.GetBool(md, "observer.resetTraffic")
+
+	h.md.limiterRefreshInterval = mdutil.GetDuration(md, "limiter.refreshInterval")
+	h.md.limiterCleanupInterval = mdutil.GetDuration(md, "limiter.cleanupInterval")
+
+	return
+}
+
+// entrypointConfig holds the configuration for a single additional entrypoint
+// beyond the primary entryPoint. Multiple entrypoints are configured via the
+// "entrypoints" metadata key as a JSON array.
+type entrypointConfig struct {
+	// Name is an optional label for this entrypoint (used in logs).
+	Name string
+	// Addr is the TCP address to listen on (e.g. "0.0.0.0:80").
+	Addr string
+	// Ingress is the ingress rule table for this entrypoint. If nil,
+	// the handler's default ingress is used.
+	Ingress ingress.Ingress
+}

@@ -1,0 +1,1311 @@
+package hop
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-gost/core/bypass"
+	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/connector"
+	"github.com/go-gost/core/dialer"
+	"github.com/go-gost/core/hop"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/core/metadata"
+	"github.com/go-gost/core/routing"
+	xmd "github.com/go-gost/x/metadata"
+	xlogger "github.com/go-gost/x/logger"
+	xselector "github.com/go-gost/x/selector"
+	xrouting "github.com/go-gost/x/routing"
+	"github.com/go-gost/x/registry"
+)
+
+// mustMatcher parses a matcher DSL rule, failing the test on error.
+func mustMatcher(t *testing.T, rule string) routing.Matcher {
+	t.Helper()
+	m, err := xrouting.NewMatcher(rule)
+	if err != nil {
+		t.Fatalf("NewMatcher(%q): %v", rule, err)
+	}
+	return m
+}
+
+// --- Mock types ---
+
+type testBypass struct {
+	whitelist bool
+	contains  bool
+}
+
+func (b *testBypass) IsWhitelist() bool               { return b.whitelist }
+func (b *testBypass) Init(md metadata.Metadata) error { return nil }
+func (b *testBypass) Contains(ctx context.Context, network, addr string, opts ...bypass.Option) bool {
+	return b.contains
+}
+
+// testNodeSelector implements selector.Selector[*chain.Node].
+type testNodeSelector struct {
+	selectedIdx int
+	callCount   int
+}
+
+func (s *testNodeSelector) Select(ctx context.Context, nodes ...*chain.Node) *chain.Node {
+	if len(nodes) == 0 {
+		return nil
+	}
+	idx := s.selectedIdx % len(nodes)
+	s.callCount++
+	return nodes[idx]
+}
+
+type testMatcher struct {
+	match bool
+}
+
+func (m *testMatcher) Match(req *routing.Request) bool { return m.match }
+
+type requestCapturingMatcher struct {
+	capture **routing.Request
+	match   bool
+}
+
+func (m *requestCapturingMatcher) Match(req *routing.Request) bool {
+	if m.capture != nil {
+		*m.capture = req
+	}
+	return m.match
+}
+
+type testLoader struct {
+	loadFn  func(ctx context.Context) (io.Reader, error)
+	closeFn func() error
+}
+
+func (l *testLoader) Load(ctx context.Context) (io.Reader, error) {
+	if l.loadFn != nil {
+		return l.loadFn(ctx)
+	}
+	return nil, nil
+}
+
+func (l *testLoader) Close() error {
+	if l.closeFn != nil {
+		return l.closeFn()
+	}
+	return nil
+}
+
+type stubConnector struct{}
+
+func (c *stubConnector) Init(md metadata.Metadata) error { return nil }
+
+func (c *stubConnector) Connect(ctx context.Context, conn net.Conn, network, address string, opts ...connector.ConnectOption) (net.Conn, error) {
+	return conn, nil
+}
+
+func newStubConnector(opts ...connector.Option) connector.Connector {
+	return &stubConnector{}
+}
+
+func newStubDialer(opts ...dialer.Option) dialer.Dialer {
+	return &stubDialer{}
+}
+
+type stubDialer struct{}
+
+func (d *stubDialer) Init(md metadata.Metadata) error { return nil }
+
+func (d *stubDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+	return &stubConn{}, nil
+}
+
+type stubConn struct{}
+
+func (c *stubConn) Read(b []byte) (n int, err error)   { return 0, io.EOF }
+func (c *stubConn) Write(b []byte) (n int, err error)  { return len(b), nil }
+func (c *stubConn) Close() error                       { return nil }
+func (c *stubConn) LocalAddr() net.Addr                { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (c *stubConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (c *stubConn) SetDeadline(t time.Time) error      { return nil }
+func (c *stubConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *stubConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func init() {
+	logger.SetDefault(xlogger.Nop())
+	registry.ConnectorRegistry().Register("http", newStubConnector)
+	registry.ConnectorRegistry().Register("socks5", newStubConnector)
+	registry.DialerRegistry().Register("tcp", newStubDialer)
+}
+
+// Helper to create a hop and return *chainHop for Close access.
+func newTestHop(opts ...Option) *chainHop {
+	return NewHop(opts...).(*chainHop)
+}
+
+// =============================================================================
+// Option tests
+// =============================================================================
+
+func TestNameOption(t *testing.T) {
+	var o options
+	NameOption("my-hop")(&o)
+	if o.name != "my-hop" {
+		t.Errorf("expected name 'my-hop', got %q", o.name)
+	}
+}
+
+func TestNodeOption(t *testing.T) {
+	var o options
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	NodeOption(n1, n2)(&o)
+	if len(o.nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(o.nodes))
+	}
+	if o.nodes[0].Name != "n1" || o.nodes[1].Name != "n2" {
+		t.Error("unexpected node content")
+	}
+}
+
+func TestBypassOption(t *testing.T) {
+	var o options
+	bp := &testBypass{}
+	BypassOption(bp)(&o)
+	if o.bypass != bp {
+		t.Error("bypass not set correctly")
+	}
+}
+
+func TestSelectorOption(t *testing.T) {
+	var o options
+	sel := &testNodeSelector{}
+	SelectorOption(sel)(&o)
+	if o.selector != sel {
+		t.Error("selector not set correctly")
+	}
+}
+
+func TestReloadPeriodOption(t *testing.T) {
+	var o options
+	ReloadPeriodOption(5 * time.Second)(&o)
+	if o.period != 5*time.Second {
+		t.Errorf("expected period 5s, got %v", o.period)
+	}
+}
+
+func TestFileLoaderOption(t *testing.T) {
+	var o options
+	ld := &testLoader{}
+	FileLoaderOption(ld)(&o)
+	if o.fileLoader != ld {
+		t.Error("fileLoader not set correctly")
+	}
+}
+
+func TestRedisLoaderOption(t *testing.T) {
+	var o options
+	ld := &testLoader{}
+	RedisLoaderOption(ld)(&o)
+	if o.redisLoader != ld {
+		t.Error("redisLoader not set correctly")
+	}
+}
+
+func TestHTTPLoaderOption(t *testing.T) {
+	var o options
+	ld := &testLoader{}
+	HTTPLoaderOption(ld)(&o)
+	if o.httpLoader != ld {
+		t.Error("httpLoader not set correctly")
+	}
+}
+
+func TestLoggerOption(t *testing.T) {
+	var o options
+	l := xlogger.Nop()
+	LoggerOption(l)(&o)
+	if o.logger != l {
+		t.Error("logger not set correctly")
+	}
+}
+
+// =============================================================================
+// NewHop tests
+// =============================================================================
+
+func TestNewHop_Empty(t *testing.T) {
+	h := newTestHop()
+	defer h.Close()
+
+	nodes := h.Nodes()
+	if len(nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	}
+}
+
+func TestNewHop_WithNodes(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	nodes := h.Nodes()
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(nodes))
+	}
+}
+
+func TestNewHop_NilLoggerDefaultsToNop(t *testing.T) {
+	h := newTestHop()
+	defer h.Close()
+	if h.logger == nil {
+		t.Error("expected non-nil logger (should default to Nop)")
+	}
+}
+
+func TestNewHop_WithLogger(t *testing.T) {
+	l := xlogger.Nop()
+	h := newTestHop(LoggerOption(l))
+	defer h.Close()
+	if h.logger != l {
+		t.Error("logger not set on chainHop")
+	}
+}
+
+func TestNewHop_NilOptionIgnored(t *testing.T) {
+	h := newTestHop(nil)
+	defer h.Close()
+	if h == nil {
+		t.Fatal("NewHop returned nil")
+	}
+}
+
+// =============================================================================
+// Nodes tests
+// =============================================================================
+
+func TestNodes_NilReceiver(t *testing.T) {
+	var ch *chainHop
+	nodes := ch.Nodes()
+	if nodes != nil {
+		t.Error("expected nil from nil receiver")
+	}
+}
+
+func TestNodes_Empty(t *testing.T) {
+	ch := &chainHop{}
+	nodes := ch.Nodes()
+	if len(nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	}
+}
+
+func TestNodes_WithData(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	ch := &chainHop{nodes: []*chain.Node{n1}}
+	nodes := ch.Nodes()
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Name != "n1" {
+		t.Errorf("expected 'n1', got %q", nodes[0].Name)
+	}
+}
+
+// =============================================================================
+// Select tests
+// =============================================================================
+
+func TestSelect_EmptyNodes(t *testing.T) {
+	h := newTestHop()
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node != nil {
+		t.Error("expected nil from empty hop")
+	}
+}
+
+func TestSelect_SingleNode(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n1" {
+		t.Errorf("expected 'n1', got %q", node.Name)
+	}
+}
+
+func TestSelect_HopBypass_BlocksAll(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	h := newTestHop(
+		NodeOption(n1),
+		BypassOption(&testBypass{contains: true}),
+	)
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node != nil {
+		t.Error("expected nil when hop-level bypass matches")
+	}
+}
+
+func TestSelect_HopBypass_Allows(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	h := newTestHop(
+		NodeOption(n1),
+		BypassOption(&testBypass{contains: false}),
+	)
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Error("expected node when bypass does not match")
+	}
+}
+
+func TestSelect_NodeBypass_SkipsBlockedNode(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.BypassNodeOption(&testBypass{contains: true}),
+	)
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (n1 blocked), got %q", node.Name)
+	}
+}
+
+func TestSelect_NodeBypass_AllNodesBlocked(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.BypassNodeOption(&testBypass{contains: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node != nil {
+		t.Error("expected nil when all nodes blocked")
+	}
+}
+
+func TestSelect_MatcherMatches(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n1" {
+		t.Errorf("expected 'n1', got %q", node.Name)
+	}
+}
+
+func TestSelect_MatcherDoesNotMatch(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: false}),
+	)
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (n1 didn't match), got %q", node.Name)
+	}
+}
+
+func TestSelect_MatcherReceivesNetwork(t *testing.T) {
+	var capturedReq *routing.Request
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&requestCapturingMatcher{capture: &capturedReq, match: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	h.Select(context.Background(), hop.NetworkSelectOption("tcp"))
+
+	if capturedReq == nil {
+		t.Fatal("request was not passed to matcher")
+	}
+	if capturedReq.Network != "tcp" {
+		t.Errorf("matcher saw Network=%q, want %q", capturedReq.Network, "tcp")
+	}
+}
+
+func TestSelect_MatcherMatchNetwork(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: false}),
+	)
+	n2 := chain.NewNode("n2", "127.0.0.1:9090",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+	)
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.NetworkSelectOption("udp"))
+	if node == nil {
+		t.Fatal("expected selected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (match=true), got %q", node.Name)
+	}
+}
+
+func TestSelect_Priority_HighestWins(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080", chain.PriorityNodeOption(5))
+	n2 := chain.NewNode("n2", "127.0.0.1:9090", chain.PriorityNodeOption(10))
+	n3 := chain.NewNode("n3", "127.0.0.1:7070")
+	h := newTestHop(NodeOption(n1, n2, n3))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (highest priority), got %q", node.Name)
+	}
+}
+
+func TestSelect_Priority_ZeroPriorityFallsToFirst(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:9090")
+	n2 := chain.NewNode("n2", "127.0.0.1:8080")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n1" {
+		t.Errorf("expected 'n1' (first node), got %q", node.Name)
+	}
+}
+
+func TestSelect_Priority_NegativeIgnored(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080", chain.PriorityNodeOption(-5))
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	// n2 sorted before n1 (-5 <= 0), and both have priority <= 0
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2', got %q", node.Name)
+	}
+}
+
+func TestSelect_WithSelector(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	sel := &testNodeSelector{selectedIdx: 1}
+	h := newTestHop(NodeOption(n1, n2), SelectorOption(sel))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (selected by selector), got %q", node.Name)
+	}
+}
+
+func TestSelect_EqualPriorityDoesNotShortcut(t *testing.T) {
+	// Two nodes with identical matchers get the same default priority.
+	// The priority shortcut must NOT trigger when multiple nodes share
+	// the highest priority — the selector should still apply.
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+		chain.PriorityNodeOption(50),
+	)
+	n2 := chain.NewNode("n2", "127.0.0.1:9090",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+		chain.PriorityNodeOption(50),
+	)
+	sel := &testNodeSelector{selectedIdx: 1} // picks n2
+	h := newTestHop(NodeOption(n1, n2), SelectorOption(sel))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (selected by selector, not shortcut), got %q", node.Name)
+	}
+}
+
+// TestSelect_FailCodesHighPriorityNode reproduces the reverse-proxy failCodes
+// bug: a node with a stricter (longer) matcher wins by auto-computed priority,
+// so the priority shortcut selected it directly and bypassed the FailFilter —
+// a node marked failed by http.failCodes could never be excluded, so failover
+// never happened. After the fix, marking the high-priority node makes Select
+// fall through to the healthy lower-priority node.
+func TestSelect_FailCodesHighPriorityNode(t *testing.T) {
+	// highPriority: stricter matcher -> longer rule -> higher auto priority.
+	highPriority := chain.NewNode("high", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+		chain.PriorityNodeOption(100), // simulates len(longer-rule)
+	)
+	// healthy: less specific matcher -> lower priority.
+	healthy := chain.NewNode("healthy", "127.0.0.1:9090",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+		chain.PriorityNodeOption(10),
+	)
+
+	sel := xselector.NewSelector[*chain.Node](
+		xselector.FIFOStrategy[*chain.Node](),
+		xselector.FailFilter[*chain.Node](1, 60*time.Second),
+	)
+
+	h := newTestHop(NodeOption(highPriority, healthy), SelectorOption(sel),
+		FailFilterSettingsOption(1, 60*time.Second))
+	defer h.Close()
+
+	// Before marking: high-priority node wins via the shortcut.
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "high" {
+		t.Fatalf("expected 'high' (higher priority) before marking, got %q", node.Name)
+	}
+
+	// Simulate http.failCodes marking the high-priority node failed (429/5xx).
+	highPriority.Marker().Mark()
+
+	// After marking: Select must fall through to the healthy node.
+	node = h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected a node after marking, got nil")
+	}
+	if node.Name != "healthy" {
+		t.Fatalf("expected 'healthy' (marked node excluded by FailFilter), got %q", node.Name)
+	}
+}
+
+// TestSelect_SingleNodeFailedLastResort: with all candidates failed, Select
+// falls back to the first matching node (best effort) instead of returning
+// nil — a transient failure (e.g. one 429) must not take a lone-node hop
+// fully down. A successful dial in the caller resets the marker.
+func TestSelect_SingleNodeFailedLastResort(t *testing.T) {
+	only := chain.NewNode("only", "127.0.0.1:8080")
+	h := newTestHop(NodeOption(only))
+	defer h.Close()
+
+	only.Marker().Mark()
+
+	node := h.Select(context.Background())
+	if node == nil || node.Name != "only" {
+		t.Fatalf("expected last-resort node 'only', got %v", node)
+	}
+}
+
+// TestSelect_AllFailedLastResort: when every candidate is marked failed, the
+// first matching node is still returned as a best-effort fallback.
+func TestSelect_AllFailedLastResort(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	n1.Marker().Mark()
+	n2.Marker().Mark()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected a last-resort node, got nil")
+	}
+	if node.Name != "n1" && node.Name != "n2" {
+		t.Fatalf("expected n1 or n2, got %q", node.Name)
+	}
+}
+
+// TestSelect_AllFailedNoMatchReturnsNil: the last resort must still respect
+// the matcher gates — a request matching no node yields nil even when nodes
+// are marked failed (no route, not a fallback target).
+func TestSelect_AllFailedNoMatchReturnsNil(t *testing.T) {
+	only := chain.NewNode("only", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: false}),
+	)
+	h := newTestHop(NodeOption(only))
+	defer h.Close()
+
+	only.Marker().Mark()
+
+	node := h.Select(context.Background())
+	if node != nil {
+		t.Fatalf("expected nil (no node matches), got %q", node.Name)
+	}
+}
+
+func TestSelect_NilNodesSkipped(t *testing.T) {
+	h := newTestHop()
+	defer h.Close()
+	h.nodes = []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080"), nil, chain.NewNode("n3", "127.0.0.1:7070")}
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name == "" {
+		t.Error("expected non-empty node name")
+	}
+}
+
+// =============================================================================
+// Select with matcher integration tests
+// =============================================================================
+
+func TestSelect_MatcherHost_Match(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n1.Options().Matcher = mustMatcher(t, "Host(`example.com`)")
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.HostSelectOption("example.com"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_MatcherHost_NoMatch(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n1.Options().Matcher = mustMatcher(t, "Host(`example.com`)")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.HostSelectOption("other.com"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (n1 host mismatch), got %q", node.Name)
+	}
+}
+
+func TestSelect_MatcherProtocol_Match(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n1.Options().Matcher = mustMatcher(t, "Proto(`http`)")
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.ProtocolSelectOption("http"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_MatcherProtocol_NoMatch(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n1.Options().Matcher = mustMatcher(t, "Proto(`http`)")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.ProtocolSelectOption("socks5"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (n1 protocol mismatch), got %q", node.Name)
+	}
+}
+
+func TestSelect_MatcherWildcardHost_MatchesApexAndSubdomain(t *testing.T) {
+	// filter `.example.com` (legacy wildcard) matches apex AND subdomains;
+	// the converter emits `Host(example.com) || Host(.example.com)`.
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n1.Options().Matcher = mustMatcher(t, "Host(`example.com`) || Host(`.example.com`)")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	for _, host := range []string{"example.com", "sub.example.com", "a.b.example.com"} {
+		node := h.Select(context.Background(), hop.HostSelectOption(host))
+		if node == nil || node.Name != "n1" {
+			t.Errorf("expected n1 for host %q, got %v", host, node)
+		}
+	}
+}
+
+func TestSelect_MatcherWildcardHost_NoSubdomainMatch(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n1.Options().Matcher = mustMatcher(t, "Host(`example.com`) || Host(`.example.com`)")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.HostSelectOption("other.net"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (n1 host mismatch), got %q", node.Name)
+	}
+}
+
+// =============================================================================
+// Select with select options
+// =============================================================================
+
+func TestSelect_WithNetworkOption(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.NetworkSelectOption("tcp"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_WithAddrOption(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.AddrSelectOption("example.com:80"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_WithClientIPOption(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	ip := net.ParseIP("10.0.0.1")
+	node := h.Select(context.Background(), hop.ClientIPSelectOption(ip))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_WithMethodOption(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.MethodSelectOption("CONNECT"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_WithHeaderOption(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	header := map[string][]string{"X-Forwarded-For": {"1.2.3.4"}}
+	node := h.Select(context.Background(), hop.HeaderSelectOption(header))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_WithMultipleOptions(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	node := h.Select(context.Background(),
+		hop.NetworkSelectOption("tcp"),
+		hop.HostSelectOption("example.com"),
+		hop.ProtocolSelectOption("http"),
+		hop.PathSelectOption("/api"),
+	)
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+func TestSelect_MatcherWithFullRequest(t *testing.T) {
+	var capturedReq *routing.Request
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&requestCapturingMatcher{capture: &capturedReq, match: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	ip := net.ParseIP("10.0.0.1")
+	node := h.Select(context.Background(),
+		hop.ClientIPSelectOption(ip),
+		hop.HostSelectOption("example.com"),
+		hop.ProtocolSelectOption("http"),
+		hop.MethodSelectOption("GET"),
+		hop.PathSelectOption("/api/v1"),
+	)
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+}
+
+// =============================================================================
+// reload tests
+// =============================================================================
+
+func TestReload_NoLoaders(t *testing.T) {
+	ch := &chainHop{
+		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}},
+		logger:  xlogger.Nop(),
+	}
+	err := ch.reload(context.Background())
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodes := ch.Nodes()
+	if len(nodes) != 1 {
+		t.Errorf("expected 1 node, got %d", len(nodes))
+	}
+}
+
+func TestReload_WithFileLoader(t *testing.T) {
+	loader := &testLoader{
+		loadFn: func(ctx context.Context) (io.Reader, error) {
+			return strings.NewReader(`[{"name": "loaded", "addr": "10.0.0.1:8080"}]`), nil
+		},
+	}
+	ch := &chainHop{
+		logger:  xlogger.Nop(),
+		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, fileLoader: loader, name: "test-hop"},
+	}
+	err := ch.reload(context.Background())
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	nodes := ch.Nodes()
+	if len(nodes) < 2 {
+		t.Errorf("expected at least 2 nodes, got %d", len(nodes))
+	}
+}
+
+func TestReload_LoaderError(t *testing.T) {
+	loadErr := errors.New("load failed")
+	loader := &testLoader{
+		loadFn: func(ctx context.Context) (io.Reader, error) {
+			return nil, loadErr
+		},
+	}
+	ch := &chainHop{
+		logger:  xlogger.Nop(),
+		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, fileLoader: loader},
+	}
+	err := ch.reload(context.Background())
+	if err == nil {
+		t.Error("expected error from failed loader")
+	}
+}
+
+func TestReload_RedisLoader(t *testing.T) {
+	loader := &testLoader{
+		loadFn: func(ctx context.Context) (io.Reader, error) {
+			return strings.NewReader(`[{"name": "redis-node", "addr": "10.0.0.2:8080"}]`), nil
+		},
+	}
+	ch := &chainHop{
+		logger:  xlogger.Nop(),
+		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, redisLoader: loader, name: "test-hop"},
+	}
+	err := ch.reload(context.Background())
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestReload_HTTPLoader(t *testing.T) {
+	loader := &testLoader{
+		loadFn: func(ctx context.Context) (io.Reader, error) {
+			return strings.NewReader(`[{"name": "http-node", "addr": "10.0.0.3:8080"}]`), nil
+		},
+	}
+	ch := &chainHop{
+		logger:  xlogger.Nop(),
+		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, httpLoader: loader, name: "test-hop"},
+	}
+	err := ch.reload(context.Background())
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestReload_MultipleLoaders(t *testing.T) {
+	fileLoader := &testLoader{
+		loadFn: func(ctx context.Context) (io.Reader, error) {
+			return strings.NewReader(`[{"name": "file-n", "addr": "10.0.0.1:8080"}]`), nil
+		},
+	}
+	redisLoader := &testLoader{
+		loadFn: func(ctx context.Context) (io.Reader, error) {
+			return strings.NewReader(`[{"name": "redis-n", "addr": "10.0.0.2:8080"}]`), nil
+		},
+	}
+	ch := &chainHop{
+		logger: xlogger.Nop(),
+		options: options{
+			nodes:       []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
+			fileLoader:  fileLoader,
+			redisLoader: redisLoader,
+			name:        "test-hop",
+		},
+	}
+	err := ch.reload(context.Background())
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestReload_LoaderErrorWithParseError(t *testing.T) {
+	loader := &testLoader{
+		loadFn: func(ctx context.Context) (io.Reader, error) {
+			return strings.NewReader(`invalid json`), nil
+		},
+	}
+	ch := &chainHop{
+		logger:  xlogger.Nop(),
+		options: options{nodes: []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")}, fileLoader: loader},
+	}
+	err := ch.reload(context.Background())
+	if err == nil {
+		t.Error("expected parse error")
+	}
+}
+
+// =============================================================================
+// parseNode tests
+// =============================================================================
+
+func TestParseNode_NilReader(t *testing.T) {
+	ch := &chainHop{logger: xlogger.Nop()}
+	nodes, err := ch.parseNode(nil)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	}
+}
+
+func TestParseNode_ValidJSON(t *testing.T) {
+	ch := &chainHop{logger: xlogger.Nop(), options: options{name: "test-hop"}}
+	r := strings.NewReader(`[{"name": "n1", "addr": "10.0.0.1:8080"}]`)
+	nodes, err := ch.parseNode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Name != "n1" {
+		t.Errorf("expected 'n1', got %q", nodes[0].Name)
+	}
+}
+
+func TestParseNode_EmptyArray(t *testing.T) {
+	ch := &chainHop{logger: xlogger.Nop()}
+	r := strings.NewReader(`[]`)
+	nodes, err := ch.parseNode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	}
+}
+
+func TestParseNode_InvalidJSON(t *testing.T) {
+	ch := &chainHop{logger: xlogger.Nop()}
+	r := strings.NewReader(`not json`)
+	nodes, err := ch.parseNode(r)
+	if err == nil {
+		t.Error("expected error for invalid JSON")
+	}
+	if len(nodes) != 0 {
+		t.Errorf("expected 0 nodes, got %d", len(nodes))
+	}
+}
+
+func TestParseNode_NilEntrySkipped(t *testing.T) {
+	ch := &chainHop{logger: xlogger.Nop(), options: options{name: "test-hop"}}
+	r := strings.NewReader(`[null, {"name": "ok", "addr": "10.0.0.1:8080"}]`)
+	nodes, err := ch.parseNode(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Name != "ok" {
+		t.Errorf("expected 'ok', got %q", nodes[0].Name)
+	}
+}
+
+func TestParseNode_SkipInvalidEntry(t *testing.T) {
+	ch := &chainHop{logger: xlogger.Nop(), options: options{name: "test-hop"}}
+	r := strings.NewReader(`[{"name": "bad"}]`)
+	nodes, err := ch.parseNode(r)
+	// May return an error via errors.Join even if some nodes parsed
+	_ = err
+	_ = nodes
+}
+
+// =============================================================================
+// Close tests
+// =============================================================================
+
+func TestClose_NoLoaders(t *testing.T) {
+	h := newTestHop()
+	err := h.Close()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestClose_WithLoaders(t *testing.T) {
+	fileClosed := false
+	redisClosed := false
+	httpClosed := false
+
+	h := newTestHop(
+		FileLoaderOption(&testLoader{closeFn: func() error { fileClosed = true; return nil }}),
+		RedisLoaderOption(&testLoader{closeFn: func() error { redisClosed = true; return nil }}),
+		HTTPLoaderOption(&testLoader{closeFn: func() error { httpClosed = true; return nil }}),
+	)
+	err := h.Close()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !fileClosed {
+		t.Error("fileLoader not closed")
+	}
+	if !redisClosed {
+		t.Error("redisLoader not closed")
+	}
+	if !httpClosed {
+		t.Error("httpLoader not closed")
+	}
+}
+
+func TestClose_CancelFuncCalled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := &chainHop{
+		cancelFunc: cancel,
+		logger:     xlogger.Nop(),
+	}
+	ch.Close()
+	select {
+	case <-ctx.Done():
+		// expected
+	default:
+		t.Error("context should be cancelled after Close")
+	}
+}
+
+// =============================================================================
+// periodReload tests
+// =============================================================================
+
+func TestPeriodReload_NoPeriod(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := &chainHop{
+		options: options{period: 0},
+		logger:  xlogger.Nop(),
+		nodes:   []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
+	}
+	err := ch.periodReload(ctx)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestPeriodReload_CancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ch := &chainHop{
+		options: options{period: time.Second},
+		logger:  xlogger.Nop(),
+		nodes:   []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
+	}
+	err := ch.periodReload(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestPeriodReload_MinimumPeriod(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := &chainHop{
+		options: options{period: time.Millisecond},
+		logger:  xlogger.Nop(),
+		nodes:   []*chain.Node{chain.NewNode("n1", "127.0.0.1:8080")},
+	}
+	time.AfterFunc(50*time.Millisecond, cancel)
+	err := ch.periodReload(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+// =============================================================================
+// Priority edge cases
+// =============================================================================
+
+func TestSelect_AllSamePriority(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080")
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	n3 := chain.NewNode("n3", "127.0.0.1:7070")
+	h := newTestHop(NodeOption(n1, n2, n3))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n1" {
+		t.Errorf("expected 'n1' (first node), got %q", node.Name)
+	}
+}
+
+func TestSelect_OnlyNegativePriorities(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080", chain.PriorityNodeOption(-5))
+	n2 := chain.NewNode("n2", "127.0.0.1:9090", chain.PriorityNodeOption(-10))
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n1" {
+		t.Errorf("expected 'n1' (higher priority), got %q", node.Name)
+	}
+}
+
+// =============================================================================
+// Select with catch-all node (no matcher = unconditional candidate)
+// =============================================================================
+
+func TestSelect_CatchAllNode_TakesOverOnNoMatch(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080") // no matcher: catch-all
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	n2.Options().Matcher = mustMatcher(t, "Host(`specific.com`)")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.HostSelectOption("other.com"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n1" {
+		t.Errorf("expected 'n1' (catch-all), got %q", node.Name)
+	}
+}
+
+func TestSelect_SpecificHostNodeWins(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080") // no matcher: catch-all
+	n2 := chain.NewNode("n2", "127.0.0.1:9090")
+	n2.Options().Matcher = mustMatcher(t, "Host(`specific.com`)")
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.HostSelectOption("specific.com"))
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n1" {
+		t.Errorf("expected 'n1' (first node when both eligible), got %q", node.Name)
+	}
+}
+
+func TestSelect_BackupPriority_LowerPriorityPrimaryWins(t *testing.T) {
+	// A lower-priority primary must beat a higher-priority backup.
+	//   Node A: priority=100, backup=true  (high-priority backup)
+	//   Node B: priority=10,  backup=false (low-priority primary)
+	// Expected: B wins — primary always beats backup regardless of priority.
+	n1 := chain.NewNode("backup-high",
+		"127.0.0.1:8080",
+		chain.PriorityNodeOption(100),
+		chain.MetadataNodeOption(xmd.NewMetadata(map[string]any{"backup": true})),
+	)
+	n2 := chain.NewNode("primary-low",
+		"127.0.0.1:9090",
+		chain.PriorityNodeOption(10),
+	)
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "primary-low" {
+		t.Errorf("expected 'primary-low' (lower-priority primary beats higher-priority backup), got %q", node.Name)
+	}
+}
+// =============================================================================
+// Interface satisfaction
+// =============================================================================
+
+func TestChainHop_ImplementsHop(t *testing.T) {
+	var _ hop.Hop = (*chainHop)(nil)
+}
+
+func TestChainHop_ImplementsNodeList(t *testing.T) {
+	var _ hop.NodeList = (*chainHop)(nil)
+}
+
+func TestNewHop_ReturnsHopInterface(t *testing.T) {
+	h := NewHop()
+	if h == nil {
+		t.Fatal("expected non-nil Hop")
+	}
+	defer h.(*chainHop).Close()
+}
+
+// =============================================================================
+// NewHop starts periodReload goroutine
+// =============================================================================
+
+func TestNewHop_StartsPeriodReload(t *testing.T) {
+	h := NewHop()
+	ch := h.(*chainHop)
+	if ch.cancelFunc == nil {
+		t.Error("expected non-nil cancelFunc")
+	}
+	h.(*chainHop).Close()
+}

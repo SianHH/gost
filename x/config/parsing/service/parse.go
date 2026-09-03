@@ -1,0 +1,666 @@
+package service
+
+import (
+	"fmt"
+	"io"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/go-gost/core/auth"
+	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/handler"
+	"github.com/go-gost/core/hop"
+	"github.com/go-gost/core/listener"
+	"github.com/go-gost/core/rewriter"
+	"github.com/go-gost/core/routing"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/core/observer/stats"
+	"github.com/go-gost/core/recorder"
+	"github.com/go-gost/core/selector"
+	"github.com/go-gost/core/service"
+	xadmission "github.com/go-gost/x/admission"
+	xauth "github.com/go-gost/x/auth"
+	xbypass "github.com/go-gost/x/bypass"
+	xchain "github.com/go-gost/x/chain"
+	"github.com/go-gost/x/config"
+	"github.com/go-gost/x/config/parsing"
+	admission_parser "github.com/go-gost/x/config/parsing/admission"
+	auth_parser "github.com/go-gost/x/config/parsing/auth"
+	bypass_parser "github.com/go-gost/x/config/parsing/bypass"
+	hop_parser "github.com/go-gost/x/config/parsing/hop"
+	logger_parser "github.com/go-gost/x/config/parsing/logger"
+	node_parser "github.com/go-gost/x/config/parsing/node"
+	selector_parser "github.com/go-gost/x/config/parsing/selector"
+	xhop "github.com/go-gost/x/hop"
+	tls_util "github.com/go-gost/x/internal/util/tls"
+	xrouting "github.com/go-gost/x/routing"
+	xs "github.com/go-gost/x/selector"
+	quota_wrapper "github.com/go-gost/x/limiter/quota/wrapper"
+	cache_limiter "github.com/go-gost/x/limiter/traffic/cache"
+	"github.com/go-gost/x/metadata"
+	mdutil "github.com/go-gost/x/metadata/util"
+	xstats "github.com/go-gost/x/observer/stats"
+	xrecorder "github.com/go-gost/x/recorder"
+	"github.com/go-gost/x/registry"
+	xservice "github.com/go-gost/x/service"
+	"github.com/vishvananda/netns"
+)
+
+// plaintextListeners are listener types that never terminate TLS on their
+// accepted connections, so any certFile/keyFile/caFile configured for them is
+// silently ignored. This catches the common footgun where a user writes e.g.
+// `tls+mws://...?certFile=...` expecting TLS: the "tls+" prefix is parsed as
+// the handler scheme (see x/config/cmd/cmd.go buildServiceConfig), not a TLS
+// wrapper, so the underlying mws listener stays plaintext. Extend this set when
+// new plaintext listeners are added.
+var plaintextListeners = map[string]bool{
+	"tcp": true, "udp": true,
+	"ws": true, "mws": true,
+	"redirect": true, "tproxy": true,
+	"rtcp": true, "rudp": true,
+	"unix": true, "runix": true, "serial": true, "stdio": true,
+}
+
+// ParseService constructs a fully-wired service.Service from a ServiceConfig.
+// It defaults the listener to "tcp" and the handler to "auto", resolves named
+// components from the registry (authers, admissions, bypasses, resolvers,
+// hosts, chains, hops, limiters, recorders, observers), composes TLS settings,
+// and applies metadata-driven options (proxy protocol, netns, sockopts,
+// pre/post hooks, stats, etc.). It returns an error if the listener or handler
+// type is unknown or if construction of any sub-component fails.
+func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
+	if cfg.Listener == nil {
+		cfg.Listener = &config.ListenerConfig{}
+	}
+	if strings.TrimSpace(cfg.Listener.Type) == "" {
+		cfg.Listener.Type = "tcp"
+	}
+
+	if cfg.Handler == nil {
+		cfg.Handler = &config.HandlerConfig{}
+	}
+	if strings.TrimSpace(cfg.Handler.Type) == "" {
+		cfg.Handler.Type = "auto"
+	}
+
+	log := logger.Default()
+	if loggers := logger_parser.List(cfg.Logger, cfg.Loggers...); len(loggers) > 0 {
+		log = logger.LoggerGroup(loggers...)
+	}
+
+	serviceLogger := log.WithFields(map[string]any{
+		"kind":     "service",
+		"service":  cfg.Name,
+		"listener": cfg.Listener.Type,
+		"handler":  cfg.Handler.Type,
+	})
+
+	tlsCfg := cfg.Listener.TLS
+	if tlsCfg == nil {
+		tlsCfg = &config.TLSConfig{}
+	}
+	tlsConfig, err := tls_util.LoadServerConfig(tlsCfg)
+	if err != nil {
+		serviceLogger.Error(err)
+		return nil, err
+	}
+	if tlsConfig == nil {
+		tlsConfig = parsing.DefaultTLSConfig().Clone()
+		tls_util.SetTLSOptions(tlsConfig, tlsCfg.Options)
+		tls_util.RejectUnknownSNIConfig(tlsConfig, tlsCfg.RejectUnknownSNI, tlsCfg.ServerNames)
+	}
+
+	if (tlsCfg.CertFile != "" || tlsCfg.KeyFile != "" || tlsCfg.CAFile != "") && plaintextListeners[cfg.Listener.Type] {
+		serviceLogger.Warnf("TLS certificate options are configured but the %q listener does not use TLS and will ignore them; the connection will be plaintext. Use a TLS-capable listener (e.g. mwss, wss, tls, quic, grpc, http2, http3) to enable TLS.",
+			cfg.Listener.Type)
+	}
+
+	authers := auth_parser.List(cfg.Listener.Auther, cfg.Listener.Authers...)
+	if len(authers) == 0 {
+		if auther := auth_parser.ParseAutherFromAuth(cfg.Listener.Auth); auther != nil {
+			authers = append(authers, auther)
+		}
+	}
+	var auther auth.Authenticator
+	if len(authers) > 0 {
+		auther = xauth.AuthenticatorGroup(authers...)
+	}
+
+	admissions := admission_parser.List(cfg.Admission, cfg.Admissions...)
+
+	var sockOpts *chain.SockOpts
+	if cfg.SockOpts != nil {
+		sockOpts = &chain.SockOpts{
+			Mark: cfg.SockOpts.Mark,
+		}
+	}
+
+	var ppv int
+	ifce := cfg.Interface
+	var preUp, preDown, postUp, postDown []string
+	var ignoreChain bool
+	var pStats stats.Stats
+	var observerPeriod time.Duration
+	var netnsIn, netnsOut string
+	var dialTimeout time.Duration
+	var labels map[string]string
+
+	var limiterRefreshInterval time.Duration
+	var limiterCleanupInterval time.Duration
+	var limiterScope string
+
+	if cfg.Metadata != nil {
+		md := metadata.NewMetadata(cfg.Metadata)
+		ppv = mdutil.GetInt(md, parsing.MDKeyProxyProtocol)
+		if v := mdutil.GetString(md, parsing.MDKeyInterface); v != "" {
+			ifce = v
+		}
+		if v := mdutil.GetInt(md, parsing.MDKeySoMark); v > 0 {
+			sockOpts = &chain.SockOpts{
+				Mark: v,
+			}
+		}
+		preUp = mdutil.GetStrings(md, parsing.MDKeyPreUp)
+		preDown = mdutil.GetStrings(md, parsing.MDKeyPreDown)
+		postUp = mdutil.GetStrings(md, parsing.MDKeyPostUp)
+		postDown = mdutil.GetStrings(md, parsing.MDKeyPostDown)
+		ignoreChain = mdutil.GetBool(md, parsing.MDKeyIgnoreChain)
+
+		if mdutil.GetBool(md, parsing.MDKeyEnableStats) {
+			pStats = xstats.NewStats(mdutil.GetBool(md, parsing.MDKeyObserverResetTraffic))
+		}
+		observerPeriod = mdutil.GetDuration(md, parsing.MDKeyObserverPeriod, "observePeriod")
+
+		netnsIn = mdutil.GetString(md, parsing.MDKeyNetns)
+		netnsOut = mdutil.GetString(md, parsing.MDKeyNetnsOut)
+
+		dialTimeout = mdutil.GetDuration(md, parsing.MDKeyDialTimeout)
+
+		limiterRefreshInterval = mdutil.GetDuration(md, parsing.MDKeyLimiterRefreshInterval)
+		limiterCleanupInterval = mdutil.GetDuration(md, parsing.MDKeyLimiterCleanupInterval)
+		limiterScope = mdutil.GetString(md, parsing.MDKeyLimiterScope)
+
+		labels = mdutil.GetStringMapString(md, parsing.MDKeyLabels)
+	}
+
+	if len(labels) > 0 {
+		serviceLogger = serviceLogger.WithFields(map[string]any{
+			"labels": labels,
+		})
+	}
+
+	listenerLogger := serviceLogger.WithFields(map[string]any{
+		"kind": "listener",
+	})
+
+	routerOpts := []chain.RouterOption{
+		chain.TimeoutRouterOption(dialTimeout),
+		chain.InterfaceRouterOption(ifce),
+		chain.NetnsRouterOption(netnsOut),
+		chain.SockOptsRouterOption(sockOpts),
+		chain.ResolverRouterOption(registry.ResolverRegistry().Get(cfg.Resolver)),
+		chain.HostMapperRouterOption(registry.HostsRegistry().Get(cfg.Hosts)),
+		chain.LoggerRouterOption(listenerLogger),
+	}
+	if !ignoreChain {
+		routerOpts = append(routerOpts,
+			chain.ChainRouterOption(chainGroup(cfg.Listener.Chain, cfg.Listener.ChainGroup, log)),
+		)
+	}
+	lnRouter := xchain.NewRouter(routerOpts...)
+
+	// The routers may hold a chainGroup running probe goroutines, and the
+	// forwarder hop may run probe goroutines of its own; make sure they are
+	// closed if service construction fails after this point.
+	var hRouter *xchain.Router
+	var fwdCloser io.Closer
+	success := false
+	defer func() {
+		if !success {
+			lnRouter.Close()
+			if hRouter != nil {
+				hRouter.Close()
+			}
+			if fwdCloser != nil {
+				fwdCloser.Close()
+			}
+		}
+	}()
+
+	listenOpts := []listener.Option{
+		listener.AddrOption(cfg.Addr),
+		listener.RouterOption(lnRouter),
+		listener.AutherOption(auther),
+		listener.AuthOption(auth_parser.Info(cfg.Listener.Auth)),
+		listener.TLSConfigOption(tlsConfig),
+		listener.AdmissionOption(xadmission.AdmissionGroup(admissions...)),
+		listener.TrafficLimiterOption(
+			cache_limiter.NewCachedTrafficLimiter(
+				registry.TrafficLimiterRegistry().Get(cfg.Limiter),
+				cache_limiter.RefreshIntervalOption(limiterRefreshInterval),
+				cache_limiter.CleanupIntervalOption(limiterCleanupInterval),
+				cache_limiter.ScopeOption(limiterScope),
+			),
+		),
+		listener.ConnLimiterOption(registry.ConnLimiterRegistry().Get(cfg.CLimiter)),
+		listener.ServiceOption(cfg.Name),
+		listener.ProxyProtocolOption(ppv),
+		listener.StatsOption(pStats),
+		listener.NetnsOption(netnsIn),
+		listener.LoggerOption(listenerLogger),
+	}
+
+	if netnsIn != "" {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		originNs, err := netns.Get()
+		if err != nil {
+			return nil, fmt.Errorf("netns.Get(): %v", err)
+		}
+		defer netns.Set(originNs)
+
+		var ns netns.NsHandle
+
+		if strings.HasPrefix(netnsIn, "/") {
+			ns, err = netns.GetFromPath(netnsIn)
+		} else {
+			ns, err = netns.GetFromName(netnsIn)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("netns.Get(%s): %v", netnsIn, err)
+		}
+		defer ns.Close()
+
+		if err := netns.Set(ns); err != nil {
+			return nil, fmt.Errorf("netns.Set(%s): %v", netnsIn, err)
+		}
+	}
+
+	var ln listener.Listener
+	if rf := registry.ListenerRegistry().Get(cfg.Listener.Type); rf != nil {
+		ln = rf(listenOpts...)
+	} else {
+		return nil, fmt.Errorf("unknown listener: %s", cfg.Listener.Type)
+	}
+
+	if cfg.Listener.Metadata == nil {
+		cfg.Listener.Metadata = make(map[string]any)
+	}
+	listenerLogger.Debugf("metadata: %v", cfg.Listener.Metadata)
+	if err := ln.Init(metadata.NewMetadata(cfg.Listener.Metadata)); err != nil {
+		listenerLogger.Error("init: ", err)
+		return nil, err
+	}
+
+	for _, qname := range cfg.Quotas {
+		ln = quota_wrapper.WrapListener(ln, strings.TrimSpace(qname))
+	}
+
+	handlerLogger := serviceLogger.WithFields(map[string]any{
+		"kind": "handler",
+	})
+
+	tlsCfg = cfg.Handler.TLS
+	if tlsCfg == nil {
+		tlsCfg = &config.TLSConfig{}
+	}
+	tlsConfig, err = tls_util.LoadServerConfig(tlsCfg)
+	if err != nil {
+		handlerLogger.Error(err)
+		return nil, err
+	}
+	if tlsConfig == nil {
+		tlsConfig = parsing.DefaultTLSConfig().Clone()
+		tls_util.SetTLSOptions(tlsConfig, tlsCfg.Options)
+		tls_util.RejectUnknownSNIConfig(tlsConfig, tlsCfg.RejectUnknownSNI, tlsCfg.ServerNames)
+	}
+
+	authers = auth_parser.List(cfg.Handler.Auther, cfg.Handler.Authers...)
+	if len(authers) == 0 {
+		if auther := auth_parser.ParseAutherFromAuth(cfg.Handler.Auth); auther != nil {
+			authers = append(authers, auther)
+		}
+	}
+
+	auther = nil
+	if len(authers) > 0 {
+		auther = xauth.AuthenticatorGroup(authers...)
+	}
+
+	// Parse skipauth from handler metadata to whitelist client IPs that
+	// should bypass authentication. Accepts both YAML arrays
+	// (skipauth: ["10.0.0.0/8"]) and comma-separated URL query values
+	// (?skipauth=10.0.0.0/8,192.168.1.1).
+	if cfg.Handler.Metadata != nil {
+		hmd := metadata.NewMetadata(cfg.Handler.Metadata)
+		skipauth := mdutil.GetStrings(hmd, "skipauth")
+		if len(skipauth) == 0 {
+			if s := mdutil.GetString(hmd, "skipauth"); s != "" {
+				for _, p := range strings.Split(s, ",") {
+					if p = strings.TrimSpace(p); p != "" {
+						skipauth = append(skipauth, p)
+					}
+				}
+			}
+		}
+		if len(skipauth) > 0 {
+			if auther != nil {
+				auther = xauth.WhitelistedAuthenticator(auther, skipauth)
+				handlerLogger.Debugf("skipauth whitelist applied: %v", skipauth)
+			} else {
+				handlerLogger.Warnf("skipauth configured but no auther set — authentication is already disabled for all clients")
+			}
+		}
+	}
+
+	var recorders []recorder.RecorderObject
+	for _, r := range cfg.Recorders {
+		md := metadata.NewMetadata(r.Metadata)
+		rec := registry.RecorderRegistry().Get(r.Name)
+		if r.Metadata != nil {
+			rec = &xrecorder.MetadataRecorder{
+				Recorder: rec,
+				Metadata: r.Metadata,
+			}
+		}
+		recorders = append(recorders, recorder.RecorderObject{
+			Recorder: rec,
+			Record:   r.Record,
+			Options: &recorder.Options{
+				Direction:       mdutil.GetBool(md, parsing.MDKeyRecorderDirection),
+				TimestampFormat: mdutil.GetString(md, parsing.MDKeyRecorderTimestampFormat),
+				Hexdump:         mdutil.GetBool(md, parsing.MDKeyRecorderHexdump),
+				HTTPBody:        mdutil.GetBool(md, parsing.MDKeyRecorderHTTPBody),
+				MaxBodySize:     mdutil.GetInt(md, parsing.MDKeyRecorderHTTPMaxBodySize),
+			},
+			Metadata: r.Metadata,
+		})
+	}
+
+	var rew rewriter.Rewriter
+	if cfg.Rewriter != "" {
+		if !registry.RewriterRegistry().IsRegistered(cfg.Rewriter) {
+			serviceLogger.Warnf("rewriter %q not found in registry", cfg.Rewriter)
+		}
+		rew = registry.RewriterRegistry().Get(cfg.Rewriter)
+	}
+
+	routerOpts = []chain.RouterOption{
+		chain.RetriesRouterOption(cfg.Handler.Retries),
+		chain.TimeoutRouterOption(dialTimeout),
+		chain.InterfaceRouterOption(ifce),
+		chain.NetnsRouterOption(netnsOut),
+		chain.SockOptsRouterOption(sockOpts),
+		chain.ResolverRouterOption(registry.ResolverRegistry().Get(cfg.Resolver)),
+		chain.HostMapperRouterOption(registry.HostsRegistry().Get(cfg.Hosts)),
+		chain.RecordersRouterOption(recorders...),
+		chain.LoggerRouterOption(handlerLogger),
+	}
+	if !ignoreChain {
+		routerOpts = append(routerOpts,
+			chain.ChainRouterOption(chainGroup(cfg.Handler.Chain, cfg.Handler.ChainGroup, log)),
+		)
+	}
+
+	var h handler.Handler
+	if rf := registry.HandlerRegistry().Get(cfg.Handler.Type); rf != nil {
+		hRouter = xchain.NewRouter(routerOpts...)
+		h = rf(
+			handler.RouterOption(hRouter),
+			handler.AutherOption(auther),
+			handler.AuthOption(auth_parser.Info(cfg.Handler.Auth)),
+			handler.BypassOption(xbypass.BypassGroup(bypass_parser.List(cfg.Bypass, cfg.Bypasses...)...)),
+			handler.TLSConfigOption(tlsConfig),
+			handler.RateLimiterOption(registry.RateLimiterRegistry().Get(cfg.RLimiter)),
+			handler.TrafficLimiterOption(registry.TrafficLimiterRegistry().Get(cfg.Handler.Limiter)),
+			handler.ObserverOption(registry.ObserverRegistry().Get(cfg.Handler.Observer)),
+			handler.RecordersOption(recorders...),
+			handler.CacheOption(registry.CacheRegistry().Get(cfg.Cache)),
+			handler.RewriterOption(rew),
+			handler.LoggerOption(handlerLogger),
+			handler.ServiceOption(cfg.Name),
+			handler.NetnsOption(netnsIn),
+		)
+	} else {
+		return nil, fmt.Errorf("unknown handler: %s", cfg.Handler.Type)
+	}
+
+	if forwarder, ok := h.(handler.Forwarder); ok {
+		hop, closer, err := parseForwarder(cfg.Forwarder, log)
+		if err != nil {
+			return nil, err
+		}
+		fwdCloser = closer
+		forwarder.Forward(hop)
+	}
+
+	if cfg.Handler.Metadata == nil {
+		cfg.Handler.Metadata = make(map[string]any)
+	}
+	handlerLogger.Debugf("metadata: %v", cfg.Handler.Metadata)
+	if err := h.Init(metadata.NewMetadata(cfg.Handler.Metadata)); err != nil {
+		handlerLogger.Error("init: ", err)
+		return nil, err
+	}
+
+	closers := []io.Closer{lnRouter, hRouter}
+	if fwdCloser != nil {
+		closers = append(closers, fwdCloser)
+	}
+	s := xservice.NewService(cfg.Name, ln, h,
+		xservice.AdmissionOption(xadmission.AdmissionGroup(admissions...)),
+		xservice.PreUpOption(preUp),
+		xservice.PreDownOption(preDown),
+		xservice.PostUpOption(postUp),
+		xservice.PostDownOption(postDown),
+		xservice.RecordersOption(recorders...),
+		xservice.StatsOption(pStats),
+		xservice.ObserverOption(registry.ObserverRegistry().Get(cfg.Observer)),
+		xservice.ObserverPeriodOption(observerPeriod),
+		xservice.LoggerOption(serviceLogger),
+		xservice.LabelsOption(labels),
+		xservice.ClosersOption(closers...),
+	)
+	success = true
+
+	serviceLogger.Infof("listening on %s/%s", s.Addr().String(), s.Addr().Network())
+	return s, nil
+}
+
+// parseForwarder builds the forwarder hop for a service. The returned
+// io.Closer is non-nil only when the hop is owned by the service (inline
+// nodes or a hop group) and must be closed on service shutdown; hops from
+// the HopRegistry are closed by the registry on unregister.
+func parseForwarder(cfg *config.ForwarderConfig, log logger.Logger) (hop.Hop, io.Closer, error) {
+	if cfg == nil {
+		return nil, nil, nil
+	}
+
+	// HopGroup takes precedence over Hop / Name / Nodes.
+	if cfg.HopGroup != nil {
+		group, err := parseHopGroup(cfg.HopGroup, log)
+		if err != nil || group == nil {
+			return nil, nil, err
+		}
+		closer, _ := group.(io.Closer)
+		return group, closer, nil
+	}
+
+	hopName := cfg.Hop
+	if hopName == "" {
+		hopName = cfg.Name
+	}
+	if hopName != "" {
+		return registry.HopRegistry().Get(hopName), nil, nil
+	}
+
+	hc := config.HopConfig{
+		Name:     cfg.Name,
+		Selector: cfg.Selector,
+	}
+	for _, node := range cfg.Nodes {
+		if node == nil {
+			continue
+		}
+
+		filter := node.Filter
+		if filter == nil {
+			if node.Protocol != "" || node.Host != "" || node.Path != "" {
+				filter = &config.NodeFilterConfig{
+					Protocol: node.Protocol,
+					Host:     node.Host,
+					Path:     node.Path,
+				}
+			}
+		}
+
+		httpCfg := node.HTTP
+		if node.Auth != nil {
+			if httpCfg == nil {
+				httpCfg = &config.HTTPNodeConfig{}
+			}
+			if httpCfg.Auth == nil {
+				httpCfg.Auth = node.Auth
+			}
+		}
+		hc.Nodes = append(hc.Nodes, &config.NodeConfig{
+			Name:     node.Name,
+			Addr:     node.Addr,
+			Network:  node.Network,
+			Bypass:   node.Bypass,
+			Bypasses: node.Bypasses,
+			Filter:   filter,
+			Matcher:  node.Matcher,
+			HTTP:     httpCfg,
+			TLS:      node.TLS,
+			Probe:    node.Probe,
+			Metadata: node.Metadata,
+		})
+	}
+	// Inline nodes build a per-service hop, owned (and closed) by the service.
+	h, err := hop_parser.ParseHop(&hc, log)
+	if err != nil || h == nil {
+		return nil, nil, err
+	}
+	closer, _ := h.(io.Closer)
+	return h, closer, nil
+}
+
+func parseHopGroup(cfg *config.ForwardHopGroupConfig, log logger.Logger) (hop.Hop, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+
+	var entries []*xhop.HopEntry
+	for _, hc := range cfg.Hops {
+		if hc == nil {
+			continue
+		}
+		h := registry.HopRegistry().Get(hc.Hop)
+		if h == nil {
+			log.Warnf("hop %q not found in hopGroup, skipping", hc.Hop)
+			continue
+		}
+
+		var m routing.Matcher
+		if hc.Matcher != nil && hc.Matcher.Rule != "" {
+			var err error
+			m, err = xrouting.NewMatcher(hc.Matcher.Rule)
+			if err != nil {
+				log.Warnf("hop %q: bad matcher rule %q: %v, skipping", hc.Hop, hc.Matcher.Rule, err)
+				continue
+			}
+		}
+
+		entries = append(entries, xhop.NewHopEntry(h, m, node_parser.ParseProbeConfig(hc.Probe)))
+	}
+
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	var hopSelector selector.Selector[hop.Hop]
+	if cfg.Selector != nil {
+		var strategy selector.Strategy[hop.Hop]
+		switch cfg.Selector.Strategy {
+		case "round", "rr":
+			strategy = xs.RoundRobinStrategy[hop.Hop]()
+		case "random", "rand":
+			strategy = xs.RandomStrategy[hop.Hop]()
+		case "fifo", "ha":
+			strategy = xs.FIFOStrategy[hop.Hop]()
+		case "hash":
+			strategy = xs.HashStrategy[hop.Hop]()
+		default:
+			strategy = xs.RoundRobinStrategy[hop.Hop]()
+		}
+		hopSelector = xs.NewSelector(
+			strategy,
+			xs.FailFilter[hop.Hop](cfg.Selector.MaxFails, cfg.Selector.FailTimeout),
+			xs.BackupFilter[hop.Hop](),
+		)
+	}
+	if hopSelector == nil {
+		hopSelector = xs.NewSelector(
+			xs.RoundRobinStrategy[hop.Hop](),
+			xs.FailFilter[hop.Hop](xs.DefaultMaxFails, xs.DefaultFailTimeout),
+			xs.BackupFilter[hop.Hop](),
+		)
+	}
+
+	return xhop.NewHopGroup(
+		xhop.WithEntriesOption(entries...),
+		xhop.WithGroupSelectorOption(hopSelector),
+		xhop.WithGroupLoggerOption(log.WithFields(map[string]any{
+			"kind":    "hopGroup",
+			"service": "forwarder",
+		})),
+	), nil
+}
+
+func chainGroup(name string, group *config.ChainGroupConfig, log logger.Logger) chain.Chainer {
+	var entries []*xchain.ChainEntry
+
+	if c := registry.ChainRegistry().Get(name); c != nil {
+		entries = append(entries, xchain.NewChainEntry(c, nil, nil))
+	}
+	if group != nil {
+		for _, ge := range group.Chains {
+			c := registry.ChainRegistry().Get(ge.Chain)
+			if c == nil {
+				log.Warnf("chain %q not found in chainGroup, skipping", ge.Chain)
+				continue
+			}
+
+			var m routing.Matcher
+			if ge.Matcher != nil && ge.Matcher.Rule != "" {
+				var err error
+				m, err = xrouting.NewMatcher(ge.Matcher.Rule)
+				if err != nil {
+					log.Warnf("chain %q: bad matcher rule %q: %v, skipping", ge.Chain, ge.Matcher.Rule, err)
+					continue
+				}
+			}
+
+			entries = append(entries, xchain.NewChainEntry(c, m, node_parser.ParseProbeConfig(ge.Probe)))
+		}
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var sel selector.Selector[chain.Chainer]
+	if group != nil {
+		sel = selector_parser.ParseChainSelector(group.Selector)
+	}
+	if sel == nil {
+		sel = selector_parser.DefaultChainSelector()
+	}
+
+	return xchain.NewChainGroup().
+		WithGroupEntries(entries...).
+		WithSelector(sel).
+		WithGroupLogger(log)
+}

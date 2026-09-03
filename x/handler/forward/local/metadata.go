@@ -1,0 +1,83 @@
+package local
+
+import (
+	"crypto"
+	"crypto/tls"
+	"crypto/x509"
+	"time"
+
+	"github.com/go-gost/core/bypass"
+	mdata "github.com/go-gost/core/metadata"
+	mdutil "github.com/go-gost/x/metadata/util"
+	"github.com/go-gost/x/registry"
+)
+
+type metadata struct {
+	// readTimeout is the deadline for the initial protocol sniffing phase
+	// (used by SnifferBuilder.ReadTimeout). After sniffing completes and
+	// raw forwarding begins, this timeout no longer applies.
+	// Default: 15s.
+	readTimeout   time.Duration
+	// idleTimeout is the idle read timeout applied to each direction of
+	// the bidirectional pipe (xnet.Pipe). A value of 0 or negative disables
+	// the timeout entirely, relying on TCP keepalives and context
+	// cancellation to detect dead connections.
+	// Default: 0 (disabled).
+	idleTimeout   time.Duration
+	httpKeepalive bool
+	proxyProtocol int
+
+	sniffing                    bool
+	sniffingTimeout             time.Duration
+	sniffingWebsocket           bool
+	sniffingWebsocketSampleRate float64
+
+	certificate *x509.Certificate
+	privateKey  crypto.PrivateKey
+	alpn        string
+	mitmBypass  bypass.Bypass
+
+	stateless  bool
+	bufferSize int
+}
+
+func (h *forwardHandler) parseMetadata(md mdata.Metadata) (err error) {
+	h.md.readTimeout = mdutil.GetDuration(md, "readTimeout")
+	if h.md.readTimeout <= 0 {
+		h.md.readTimeout = 15 * time.Second
+	}
+
+	h.md.idleTimeout = mdutil.GetDuration(md, "idleTimeout")
+	if h.md.idleTimeout < 0 {
+		h.md.idleTimeout = 0
+	}
+
+	h.md.httpKeepalive = mdutil.GetBool(md, "http.keepalive")
+	h.md.proxyProtocol = mdutil.GetInt(md, "proxyProtocol")
+
+	h.md.sniffing = mdutil.GetBool(md, "sniffing")
+	h.md.sniffingTimeout = mdutil.GetDuration(md, "sniffing.timeout")
+	h.md.sniffingWebsocket = mdutil.GetBool(md, "sniffing.websocket")
+	h.md.sniffingWebsocketSampleRate = mdutil.GetFloat(md, "sniffing.websocket.sampleRate")
+
+	certFile := mdutil.GetString(md, "mitm.certFile", "mitm.caCertFile")
+	keyFile := mdutil.GetString(md, "mitm.keyFile", "mitm.caKeyFile")
+	if certFile != "" && keyFile != "" {
+		tlsCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return err
+		}
+		h.md.certificate = tlsCert.Leaf
+		h.md.privateKey = tlsCert.PrivateKey
+	}
+	h.md.alpn = mdutil.GetString(md, "mitm.alpn")
+	h.md.mitmBypass = registry.BypassRegistry().Get(mdutil.GetString(md, "mitm.bypass"))
+
+	h.md.stateless = mdutil.GetBool(md, "stateless")
+	h.md.bufferSize = mdutil.GetInt(md, "bufferSize", "readBufferSize", "udp.bufferSize")
+	if h.md.bufferSize <= 0 {
+		h.md.bufferSize = 4096
+	}
+
+	return
+}

@@ -1,0 +1,122 @@
+package ss
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"time"
+
+	"strings"
+
+	"github.com/go-gost/core/connector"
+	md "github.com/go-gost/core/metadata"
+	"github.com/go-gost/go-shadowsocks2/core"
+	"github.com/go-gost/go-shadowsocks2/socks"
+	"github.com/go-gost/go-shadowsocks2/utils"
+	"github.com/go-gost/gosocks5"
+	ctxvalue "github.com/go-gost/x/ctx"
+	"github.com/go-gost/x/internal/util/ss/none"
+	"github.com/go-gost/x/registry"
+)
+
+func init() {
+	registry.ConnectorRegistry().Register("ss", NewConnector)
+}
+
+type ssConnector struct {
+	client  core.TCPClient
+	md      metadata
+	options connector.Options
+}
+
+func NewConnector(opts ...connector.Option) connector.Connector {
+	options := connector.Options{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	return &ssConnector{
+		options: options,
+	}
+}
+
+func (c *ssConnector) Init(md md.Metadata) (err error) {
+	if err = c.parseMetadata(md); err != nil {
+		return
+	}
+
+	if c.options.Auth == nil {
+		return errors.New("ss: auth is required")
+	}
+
+	method := c.options.Auth.Username()
+	password, _ := c.options.Auth.Password()
+
+	if strings.EqualFold(method, "none") || strings.EqualFold(method, "dummy") {
+		c.client = core.NewTCPClient(core.ClientConfig{Cipher: none.Cipher})
+		return
+	}
+
+	clientConfig, err := utils.NewClientConfig(method, password)
+	if err != nil {
+		return err
+	}
+
+	c.client = core.NewTCPClient(clientConfig)
+
+	return
+}
+
+func (c *ssConnector) Connect(ctx context.Context, conn net.Conn, network, address string, opts ...connector.ConnectOption) (net.Conn, error) {
+	log := c.options.Logger.WithFields(map[string]any{
+		"remote":  conn.RemoteAddr().String(),
+		"local":   conn.LocalAddr().String(),
+		"network": network,
+		"address": address,
+		"sid":     string(ctxvalue.SidFromContext(ctx)),
+	})
+	log.Debugf("connect %s/%s", address, network)
+
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		if _, ok := conn.(net.PacketConn); ok {
+			err := fmt.Errorf("tcp over udp is unsupported")
+			log.Error(err)
+			return nil, err
+		}
+	default:
+		err := fmt.Errorf("network %s is unsupported", network)
+		log.Error(err)
+		return nil, err
+	}
+
+	addr := gosocks5.Addr{}
+	if err := addr.ParseFrom(address); err != nil {
+		log.Error(err)
+		return nil, err
+	}
+	// The wrapped conn stores this target and only writes it on first I/O,
+	// so it must be owned by this connection, not a shared pooled buffer
+	// (see go-gost/gost#896).
+	const maxAddrLen = 1 + 1 + 255 + 2 // SOCKS5 addr: atyp + len + host + port
+
+	target := make([]byte, maxAddrLen)
+	n, err := addr.Encode(target)
+	if err != nil {
+		log.Error("encoding addr: ", err)
+		return nil, err
+	}
+
+	if c.md.connectTimeout > 0 {
+		conn.SetDeadline(time.Now().Add(c.md.connectTimeout))
+		defer conn.SetDeadline(time.Time{})
+	}
+
+	conn, err = c.client.WrapConn(conn, socks.Addr(target[:n]))
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}

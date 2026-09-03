@@ -1,0 +1,516 @@
+// Package hop provides a hop (node group) implementation that selects a node
+// from a group of proxy nodes using load-balancing strategies, filters, and
+// bypass rules. It supports periodic reloading of node lists from file, Redis,
+// or HTTP sources.
+package hop
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/go-gost/core/bypass"
+	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/hop"
+	"github.com/go-gost/core/logger"
+	"github.com/go-gost/core/routing"
+	"github.com/go-gost/core/selector"
+	"github.com/go-gost/x/config"
+	xs "github.com/go-gost/x/selector"
+	mdutil "github.com/go-gost/x/metadata/util"
+	node_parser "github.com/go-gost/x/config/parsing/node"
+	"github.com/go-gost/x/internal/loader"
+	xlogger "github.com/go-gost/x/logger"
+)
+
+type options struct {
+	name        string
+	nodes       []*chain.Node
+	bypass      bypass.Bypass
+	selector    selector.Selector[*chain.Node]
+	// failMaxFails / failTimeout mirror the FailFilter config used by the
+	// selector. Node selection consults them via selector.IsFailed to skip
+	// nodes currently marked failed (FailFilter itself no-ops on a single
+	// node, so the marker is checked here instead).
+	failMaxFails int
+	failTimeout  time.Duration
+	fileLoader  loader.Loader
+	redisLoader loader.Loader
+	httpLoader  loader.Loader
+	period      time.Duration
+	logger      logger.Logger
+}
+
+// Option configures a hop.
+type Option func(*options)
+
+// NameOption sets the hop name.
+func NameOption(name string) Option {
+	return func(o *options) {
+		o.name = name
+	}
+}
+
+// NodeOption sets the initial node list for the hop.
+func NodeOption(nodes ...*chain.Node) Option {
+	return func(o *options) {
+		o.nodes = nodes
+	}
+}
+
+// BypassOption sets a hop-level bypass that can skip the entire hop.
+func BypassOption(bp bypass.Bypass) Option {
+	return func(o *options) {
+		o.bypass = bp
+	}
+}
+
+// SelectorOption sets the load-balancing strategy for node selection.
+func SelectorOption(s selector.Selector[*chain.Node]) Option {
+	return func(o *options) {
+		o.selector = s
+	}
+}
+
+// FailFilterSettingsOption sets the maxFails/failTimeout used by the hop's
+// FailFilter. The pre-selection dead-node filter consults these to decide
+// whether a node is currently marked failed.
+func FailFilterSettingsOption(maxFails int, timeout time.Duration) Option {
+	return func(o *options) {
+		o.failMaxFails = maxFails
+		o.failTimeout = timeout
+	}
+}
+
+// ReloadPeriodOption sets the interval for periodic reloading of node lists.
+func ReloadPeriodOption(period time.Duration) Option {
+	return func(opts *options) {
+		opts.period = period
+	}
+}
+
+// FileLoaderOption sets a loader that reads node configs from a file source.
+func FileLoaderOption(fileLoader loader.Loader) Option {
+	return func(opts *options) {
+		opts.fileLoader = fileLoader
+	}
+}
+
+// RedisLoaderOption sets a loader that reads node configs from a Redis source.
+func RedisLoaderOption(redisLoader loader.Loader) Option {
+	return func(opts *options) {
+		opts.redisLoader = redisLoader
+	}
+}
+
+// HTTPLoaderOption sets a loader that reads node configs from an HTTP source.
+func HTTPLoaderOption(httpLoader loader.Loader) Option {
+	return func(opts *options) {
+		opts.httpLoader = httpLoader
+	}
+}
+
+// LoggerOption sets the logger for the hop.
+func LoggerOption(logger logger.Logger) Option {
+	return func(opts *options) {
+		opts.logger = logger
+	}
+}
+
+type chainHop struct {
+	nodes      []*chain.Node
+	options    options
+	logger     logger.Logger
+	mu         sync.RWMutex
+	cancelFunc context.CancelFunc
+}
+
+// NewHop creates a new hop with the given options and starts periodic reloading.
+func NewHop(opts ...Option) hop.Hop {
+	var options options
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	p := &chainHop{
+		nodes:      options.nodes,
+		cancelFunc: cancel,
+		options:    options,
+		logger:     options.logger,
+	}
+
+	if p.logger == nil {
+		p.logger = xlogger.Nop()
+	}
+
+	go p.periodReload(ctx)
+
+	return p
+}
+
+func (p *chainHop) Nodes() []*chain.Node {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.nodes
+}
+
+// Select chooses a node from the hop group for the given request context.
+//
+// Selection pipeline:
+//
+//  1. Hop-level bypass         — entire hop skipped if bypass matches (addr/host)
+//  2. Per-node matcher (pool)  — each candidate must pass the gate:
+//       routing.Matcher         — boolean expression (Host/Protocol/Method/
+//                                  Path/Query/Header/Body). Match → non-zero
+//                                  Priority. Nodes without a matcher are
+//                                  unconditional candidates.
+//     Nodes that fail the gate or hit a node-level bypass are excluded.
+//  3. Priority short-circuit   — if the top node has strictly higher Priority
+//                                (>0) than the rest and no backup flag is present,
+//                                it wins directly (selector skipped).
+//  4. Selector                 — Filters (FailFilter, BackupFilter) cull the pool,
+//                                then Strategy (roundRobin/random/fifo/hash/parallel)
+//                                picks one.
+//
+// Returns nil when no node survives all stages.
+func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.Node {
+	var options hop.SelectOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	log := p.logger
+
+	// Stage 1: hop-level bypass.
+	if p.options.bypass != nil &&
+		p.options.bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOption(options.Host)) {
+		return nil
+	}
+
+	// Stage 2: build candidate pool — each node must pass one of two gates.
+	// Track priority stats and backup presence during the scan so we can
+	// skip a separate sort/scan in the common all-equal-priority case.
+	var (
+		nodes        []*chain.Node
+		maxPriority  int
+		maxPriCount  int
+		maxPriNode   *chain.Node
+		hasBackup    bool
+		sawFailed    bool
+	)
+	for _, node := range p.Nodes() {
+		if node == nil {
+			continue
+		}
+		// A node currently marked failed (http.failCodes match, probe failure)
+		// is never selected, regardless of its priority or matcher. Checked
+		// before the eligibility gates so failed nodes skip matcher evaluation
+		// (body matching reads a large request prefix) and never reach the
+		// priority short-circuit.
+		if xs.IsFailed(node, p.options.failMaxFails, p.options.failTimeout) {
+			sawFailed = true
+			continue
+		}
+		if !p.nodeMatches(ctx, node, &options) {
+			continue
+		}
+		if matcher := node.Options().Matcher; matcher != nil {
+			log.Debugf("node %s match request %s %s, priority %d", node.Name, options.Protocol, options.Host, node.Options().Priority)
+		}
+
+		pri := node.Options().Priority
+		if pri > maxPriority {
+			maxPriority = pri
+			maxPriCount = 1
+			maxPriNode = node
+		} else if pri == maxPriority {
+			maxPriCount++
+		}
+
+		if !hasBackup && mdutil.GetBool(node.Options().Metadata, "backup") {
+			hasBackup = true
+		}
+
+		nodes = append(nodes, node)
+	}
+	if len(nodes) == 0 {
+		if sawFailed {
+			// All candidates are marked failed. Best-effort last resort: return
+			// the first candidate that matches this request, so a transient
+			// failure (e.g. a single 429) doesn't take the hop fully down — a
+			// successful dial in the caller resets the marker, so the node
+			// recovers as soon as it works again. Requests matching no node
+			// still yield nil (no route).
+			for _, node := range p.Nodes() {
+				if node != nil &&
+					xs.IsFailed(node, p.options.failMaxFails, p.options.failTimeout) &&
+					p.nodeMatches(ctx, node, &options) {
+					log.Debugf("last resort: node %s selected (all candidates failed)", node.Name)
+					return node
+				}
+			}
+		}
+		return nil
+	}
+	if len(nodes) == 1 {
+		return nodes[0]
+	}
+
+	// Stage 3: priority short-circuit.
+	// maxPriCount == 1 means the top-priority node is strictly higher than
+	// all others (no tie). Only fire when the top node itself is a primary —
+	// if it's a backup we must fall through to Stage 4 so the selector can
+	// prefer any lower-priority primary.
+	if maxPriority > 0 && maxPriCount == 1 && !isBackupNode(maxPriNode) {
+		p.logger.Debugf("priority shortcut: node %s selected", maxPriNode.Name)
+		return maxPriNode
+	}
+
+	// Stage 4: selector — filters then strategy.
+	s := p.options.selector
+
+	// All same priority (the common case — e.g. no matchers configured).
+	// Skip the sort and tier partition entirely.
+	if maxPriCount == len(nodes) {
+		if s != nil {
+			return s.Select(ctx, nodes...)
+		}
+		return nodes[0]
+	}
+
+	// Mixed priorities. Sort descending, then feed each priority tier to
+	// the selector, falling through when a tier yields nothing.
+
+	// Scan once: does the candidate pool contain at least one primary?
+	// When it does, skip backup-only tiers entirely — a lower-priority
+	// primary always beats a higher-priority backup.
+	var hasAnyPrimary bool
+	if hasBackup {
+		for _, n := range nodes {
+			if !mdutil.GetBool(n.Options().Metadata, "backup") {
+				hasAnyPrimary = true
+				break
+			}
+		}
+	}
+
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Options().Priority > nodes[j].Options().Priority
+	})
+	start := 0
+	for i := 1; i <= len(nodes); i++ {
+		if i == len(nodes) || nodes[i].Options().Priority != nodes[start].Options().Priority {
+			// Skip backup-only tier when primaries exist in the pool.
+			if hasAnyPrimary && isAllBackup(nodes[start:i]) {
+				start = i
+				continue
+			}
+			if s != nil {
+				if v := s.Select(ctx, nodes[start:i]...); v != nil {
+					return v
+				}
+			} else {
+				return nodes[start]
+			}
+			start = i
+		}
+	}
+	return nil
+}
+
+// isBackupNode reports whether a node is marked as backup in its metadata.
+func isBackupNode(node *chain.Node) bool {
+	return mdutil.GetBool(node.Options().Metadata, "backup")
+}
+
+// isAllBackup reports whether all nodes in the slice are backup nodes.
+func isAllBackup(nodes []*chain.Node) bool {
+	for _, n := range nodes {
+		if !mdutil.GetBool(n.Options().Metadata, "backup") {
+			return false
+		}
+	}
+	return len(nodes) > 0
+}
+
+// nodeMatches reports whether node passes the per-node bypass and matcher
+// gates for the given selection options. Shared by the candidate-pool scan
+// and the all-failed last-resort fallback. A node with no matcher is an
+// unconditional candidate (legacy filter config is normalized to a matcher
+// at parse time).
+func (p *chainHop) nodeMatches(ctx context.Context, node *chain.Node, opts *hop.SelectOptions) bool {
+	if node == nil {
+		return false
+	}
+	if node.Options().Bypass != nil &&
+		node.Options().Bypass.Contains(ctx, opts.Network, opts.Addr, bypass.WithHostOption(opts.Host)) {
+		return false
+	}
+	if matcher := node.Options().Matcher; matcher != nil {
+		req := routing.Request{
+			ClientIP: opts.ClientIP,
+			Network:  opts.Network,
+			Host:     opts.Host,
+			Protocol: opts.Protocol,
+			Method:   opts.Method,
+			Path:     opts.Path,
+			Query:    opts.Query,
+			Header:   opts.Header,
+			Body:     opts.Body,
+		}
+		return matcher.Match(&req)
+	}
+	return true
+}
+
+func (p *chainHop) periodReload(ctx context.Context) error {
+	if err := p.reload(ctx); err != nil {
+		p.logger.Warnf("reload: %v", err)
+	}
+
+	period := p.options.period
+	if period <= 0 {
+		return nil
+	}
+	if period < time.Second {
+		period = time.Second
+	}
+
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := p.reload(ctx); err != nil {
+				p.logger.Warnf("reload: %v", err)
+				// return err
+			}
+			p.logger.Debug("hop reload done")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (p *chainHop) reload(ctx context.Context) (err error) {
+	nodes := p.options.nodes
+
+	nl, err := p.load(ctx)
+
+	nodes = append(nodes, nl...)
+
+	p.logger.Debugf("load items %d", len(nodes))
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.nodes = nodes
+
+	return
+}
+
+func (p *chainHop) load(ctx context.Context) (nodes []*chain.Node, err error) {
+	var errs []error
+
+	if loader := p.options.fileLoader; loader != nil {
+		r, er := loader.Load(ctx)
+		if er != nil {
+			p.logger.Warnf("file loader: %v", er)
+			errs = append(errs, er)
+		}
+		ns, pe := p.parseNode(r)
+		if pe != nil {
+			errs = append(errs, pe)
+		}
+		nodes = append(nodes, ns...)
+	}
+
+	if loader := p.options.redisLoader; loader != nil {
+		r, er := loader.Load(ctx)
+		if er != nil {
+			p.logger.Warnf("redis loader: %v", er)
+			errs = append(errs, er)
+		}
+		ns, pe := p.parseNode(r)
+		if pe != nil {
+			errs = append(errs, pe)
+		}
+		nodes = append(nodes, ns...)
+	}
+
+	if loader := p.options.httpLoader; loader != nil {
+		r, er := loader.Load(ctx)
+		if er != nil {
+			p.logger.Warnf("http loader: %v", er)
+			errs = append(errs, er)
+		}
+		ns, pe := p.parseNode(r)
+		if pe != nil {
+			errs = append(errs, pe)
+		}
+		nodes = append(nodes, ns...)
+	}
+
+	return nodes, errors.Join(errs...)
+}
+
+func (p *chainHop) parseNode(r io.Reader) ([]*chain.Node, error) {
+	if r == nil {
+		return nil, nil
+	}
+
+	var ncs []*config.NodeConfig
+	if err := json.NewDecoder(r).Decode(&ncs); err != nil {
+		return nil, err
+	}
+
+	var (
+		nodes []*chain.Node
+		errs  []error
+	)
+	for _, nc := range ncs {
+		if nc == nil {
+			continue
+		}
+
+		node, err := node_parser.ParseNode(p.options.name, nc, logger.Default())
+		if err != nil {
+			p.logger.Warnf("skip node %s: %v", nc.Name, err)
+			errs = append(errs, err)
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, errors.Join(errs...)
+}
+
+func (p *chainHop) Close() error {
+	p.cancelFunc()
+	for _, n := range p.Nodes() {
+		if n != nil {
+			n.Close()
+		}
+	}
+	if p.options.fileLoader != nil {
+		p.options.fileLoader.Close()
+	}
+	if p.options.redisLoader != nil {
+		p.options.redisLoader.Close()
+	}
+	if p.options.httpLoader != nil {
+		p.options.httpLoader.Close()
+	}
+	return nil
+}
+
