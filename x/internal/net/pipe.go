@@ -45,6 +45,15 @@ func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser, opts ...PipeOption) 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	go func() {
+		<-ctx.Done()
+		// clean up the last remaining packets.
+		_, _ = io.Copy(io.Discard, rw1)
+		_, _ = io.Copy(io.Discard, rw2)
+		_ = rw1.Close()
+		_ = rw2.Close()
+	}()
+
 	errCh := make(chan error, 2)
 
 	// 启动两个方向的传输
