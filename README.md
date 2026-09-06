@@ -15,6 +15,17 @@ gost -L socks5://:1080 -F quic://127.0.0.1:8443?tx=10
 
 # UseBrutal 开启丢包补偿机制，实际占用带宽会大于设定的10mbps
 gost -L "quic://:8443?tx=10&txCompensation=true"
+
+# 使用 xhttp 过CDN
+gost -L xhttp://:8080 -L xhttps://:8443
+
+# 不同模式
+# auto
+# stream-up
+# packet-up
+# stream-one
+# 推荐优先级：stream-one > stream-up > packet-up
+gost -L http://:7890 -F xhttp://127.0.0.1:8443?mode=auto
 ```
 
 # GO Simple Tunnel
