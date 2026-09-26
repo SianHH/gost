@@ -48,6 +48,8 @@ func Pipe(ctx context.Context, rw1, rw2 io.ReadWriteCloser, opts ...PipeOption) 
 	go func() {
 		<-ctx.Done()
 		// clean up the last remaining packets.
+		// delay cleaning for 60 seconds.
+		time.Sleep(time.Minute)
 		_, _ = io.Copy(io.Discard, rw1)
 		_, _ = io.Copy(io.Discard, rw2)
 		_ = rw1.Close()
