@@ -5,4 +5,5 @@ use (
 	./quic-go
 	./webtransport-go
 	./x
+	./xhttp
 )
