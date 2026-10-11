@@ -56,7 +56,7 @@ import (
 // new plaintext listeners are added.
 var plaintextListeners = map[string]bool{
 	"tcp": true, "udp": true,
-	"ws": true, "mws": true,
+	"ws": true, "mws": true, "xhttp": true,
 	"redirect": true, "tproxy": true,
 	"rtcp": true, "rudp": true,
 	"unix": true, "runix": true, "serial": true, "stdio": true,
@@ -112,7 +112,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	}
 
 	if (tlsCfg.CertFile != "" || tlsCfg.KeyFile != "" || tlsCfg.CAFile != "") && plaintextListeners[cfg.Listener.Type] {
-		serviceLogger.Warnf("TLS certificate options are configured but the %q listener does not use TLS and will ignore them; the connection will be plaintext. Use a TLS-capable listener (e.g. mwss, wss, tls, quic, grpc, http2, http3) to enable TLS.",
+		serviceLogger.Warnf("TLS certificate options are configured but the %q listener does not use TLS and will ignore them; the connection will be plaintext. Use a TLS-capable listener (e.g. mwss, wss, xhttps, tls, quic, grpc, http2, http3) to enable TLS.",
 			cfg.Listener.Type)
 	}
 

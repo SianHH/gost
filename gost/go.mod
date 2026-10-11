@@ -4,6 +4,8 @@ go 1.26.3
 
 replace github.com/go-gost/x v0.16.0 => ../x
 
+replace xhttp v0.0.0 => ../xhttp
+
 require (
 	github.com/go-gost/core v0.6.1
 	github.com/go-gost/x v0.16.0
@@ -172,4 +174,5 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gvisor.dev/gvisor v0.0.0-20260701204157-69c2d17aea96 // indirect
+	xhttp v0.0.0 // indirect
 )

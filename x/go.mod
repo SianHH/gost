@@ -8,6 +8,8 @@ replace github.com/quic-go/webtransport-go v0.11.1 => ../webtransport-go
 
 replace github.com/ugorji/go v1.1.4 => github.com/ugorji/go/codec v1.2.12
 
+replace xhttp v0.0.0 => ../xhttp
+
 require (
 	github.com/alecthomas/units v0.0.0-20240927000941-0f3dac36c52b
 	github.com/andybalholm/brotli v1.2.3
@@ -70,6 +72,7 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
 	gvisor.dev/gvisor v0.0.0-20260701204157-69c2d17aea96
+	xhttp v0.0.0
 )
 
 require (

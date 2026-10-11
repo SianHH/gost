@@ -48,6 +48,7 @@ import (
 	_ "github.com/go-gost/x/dialer/unix"
 	_ "github.com/go-gost/x/dialer/utls"
 	_ "github.com/go-gost/x/dialer/ws"
+	_ "github.com/go-gost/x/dialer/xhttp"
 
 	// Register handlers
 	_ "github.com/go-gost/x/handler/api"
@@ -114,4 +115,5 @@ import (
 	_ "github.com/go-gost/x/listener/udp"
 	_ "github.com/go-gost/x/listener/unix"
 	_ "github.com/go-gost/x/listener/ws"
+	_ "github.com/go-gost/x/listener/xhttp"
 )

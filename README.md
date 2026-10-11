@@ -17,6 +17,29 @@ gost -L socks5://:1080 -F quic://127.0.0.1:8443?tx=10
 gost -L "quic://:8443?tx=10&txCompensation=true"
 ```
 
+```shell
+# 服务端
+# 无TLS
+gost -L "relay+xhttp://:8443"
+
+# 有TLS，不设置certFile和keyFile，则使用内置证书
+gost -L "relay+xhttps://:8443?certFile=cert.pem&keyFile=key.pem"
+
+# 客户端
+# 无TLS
+gost -L "tcp://:8080/192.168.1.1:80" -F "relay+xhttp://server:8443"
+
+# 有TLS，不配置secure则不校验证书
+gost -L "tcp://:8080/192.168.1.1:80" -F "relay+xhttps://server:8443?secure=true&caFile=ca.pem"
+
+# 设置xhttp mode
+# 默认packet-up
+# 转发性能 packet-up < stream-up < stream-one
+# 兼容性 packet-up > stream-up > stream-one
+# mode仅dialer有效
+gost -L "tcp://:8080/192.168.1.1:80" -F "relay+xhttp://server:8443?mode=packet-up"
+```
+
 # GO Simple Tunnel
 
 ### GO语言实现的安全隧道
