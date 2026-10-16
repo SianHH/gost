@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	xhdialer "xhttp/dialer"
+
 	"github.com/go-gost/core/dialer"
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
@@ -21,7 +23,6 @@ import (
 	net_dialer "github.com/go-gost/x/internal/net/dialer"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	"github.com/go-gost/x/registry"
-	xhdialer "xhttp/dialer"
 )
 
 func init() {
@@ -99,6 +100,11 @@ func (d *xhttpDialer) Dial(ctx context.Context, addr string, opts ...dialer.Dial
 		// default so the server can choose.
 		if len(tlsConfig.NextProtos) == 0 {
 			tlsConfig.NextProtos = []string{"h2", "http/1.1"}
+		}
+
+		// 重写ServerName为Host
+		if host != "" {
+			tlsConfig.ServerName = host
 		}
 	}
 
