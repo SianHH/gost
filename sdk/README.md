@@ -95,6 +95,7 @@ TAGS=gost_all bash scripts/build-android.sh
 typedef void (*gost_log_cb)(int level, const char *msg);
 
 extern char* gost_version(void);
+extern int   gost_setenv(char* key, char* value, char** errOut);
 extern void  gost_set_log_callback(gost_log_cb fn);
 extern void  gost_set_log_level(int level);
 extern int   gost_log_level(void);
@@ -107,7 +108,8 @@ extern void  gost_free(char* p);
 
 约定：
 
-- **返回值**：`gost_start` / `gost_stop` / `gost_reload` 返回 0 表示成功，非 0 表示失败。
+- **返回值**：`gost_setenv` / `gost_start` / `gost_stop` / `gost_reload` 返回 0 表示成功，非 0
+  表示失败。
 - **错误串**：失败时 `*errOut` 收到一段 UTF-8 字符串，**必须**用 `gost_free` 释放；成功时
   写入 NULL。`errOut` 传 NULL 表示不关心错误信息。
 - **`gost_version` 的返回值是库持有的只读常量，不要 free。**
@@ -118,6 +120,39 @@ extern void  gost_free(char* p);
 - **日志回调**在一条专用 goroutine 上被调用，**不在** gost 的业务 goroutine 上，因此回调里
   可以安全地反过来调用本库的任意导出函数（比如 `gost_stop`）。但回调不能长时间阻塞——队列
   满时日志会被丢弃而不是阻塞数据面。
+
+### Android 上必须先调 gost_setenv
+
+Go 在 Android 上拿到的是一个**空环境**。`-buildmode=c-shared` 的入口点
+`_rt0_<arch>_android_lib` 硬编码了 `argc = 1` 和一个以 NULL 结尾的空 envv（见
+`GOROOT/src/runtime/rt0_android_*.s`），于是运行时的 `goenvs_unix()` 数出 0 个变量，
+`syscall.envs` —— 也就是 `os.Getenv` 真正读的那份快照 —— **永远为空**。
+
+从 Java/Kotlin 调 `android.system.Os.setenv`（或 `libc` 的 `setenv`）改的是 bionic 的
+`environ`，Go 从来不看它。唯一能改到 Go 那份环境的方式是让 Go 自己改，也就是这个导出
+函数：它内部走 `os.Setenv`，直接改 `syscall.envs`。
+
+不调用它的话，在 App 沙箱里**每一次 `gost_start` 都会失败**，因为 `os.TempDir()` 在
+`TMPDIR` 为空时对 Android 返回硬编码的 `/data/local/tmp`（`os/file_unix.go`），而该目录
+属 `shell`、权限 0771，普通 App 无权写入；引擎又恰恰通过 `os.CreateTemp` 暂存配置。报错
+形如：
+
+```
+gost: stage config: open /data/local/tmp/gost-xxxxxx.json: permission denied
+```
+
+`HOME` 同理：`os.UserHomeDir()` 在 Android 上回退到不可写的 `/sdcard`，而
+`x/config/parsing/tls.go` 会把自动生成的证书写进 `$HOME/.gost`。
+
+宿主应该在第一次 `gost_start` **之前**注入这两个变量：
+
+```c
+gost_setenv("TMPDIR", "/data/user/0/<pkg>/cache",  &err);  /* cacheDir，无需权限 */
+gost_setenv("HOME",   "/data/user/0/<pkg>/files",  &err);  /* filesDir，证书要持久 */
+```
+
+时机要求不苛刻——引擎只在首次 `Start` 里创建那个临时文件——但**必须在第一次启动前**，
+之后改就来不及了。
 
 ### 配置格式
 

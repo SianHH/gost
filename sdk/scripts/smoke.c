@@ -27,18 +27,24 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>
 typedef HMODULE lib_handle_t;
 #define LOAD_LIB(p) LoadLibraryA(p)
 #define LOAD_SYM(h, s) ((void *)GetProcAddress(h, s))
+#define MKDIR(p) _mkdir(p)
 #else
 #include <dlfcn.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 typedef void *lib_handle_t;
 #define LOAD_LIB(p) dlopen(p, RTLD_NOW | RTLD_LOCAL)
 #define LOAD_SYM(h, s) dlsym(h, s)
+#define MKDIR(p) mkdir(p, 0700)
 #endif
 
 typedef void (*gost_log_cb)(int level, const char *msg);
 typedef char *(*fn_version)(void);
+typedef int (*fn_setenv)(char *, char *, char **);
 typedef void (*fn_set_log_callback)(gost_log_cb);
 typedef void (*fn_set_log_level)(int);
 typedef int (*fn_log_level)(void);
@@ -49,6 +55,7 @@ typedef int (*fn_is_running)(void);
 typedef void (*fn_free)(char *);
 
 static fn_version p_version;
+static fn_setenv p_setenv;
 static fn_set_log_callback p_set_log_callback;
 static fn_set_log_level p_set_log_level;
 static fn_log_level p_log_level;
@@ -92,6 +99,16 @@ static void on_log(int level, const char *msg) {
 	if (log_count <= 12) {
 		printf("  [gost %s] %s\n", level_name(level), msg);
 	}
+}
+
+/* file_exists returns 1 when path is readable. */
+static int file_exists(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		return 0;
+	}
+	fclose(f);
+	return 1;
 }
 
 /* port_open returns 1 when something is listening on 127.0.0.1:port. */
@@ -186,6 +203,7 @@ int main(int argc, char **argv) {
 	}
 
 	p_version = (fn_version)LOAD_SYM(h, "gost_version");
+	p_setenv = (fn_setenv)LOAD_SYM(h, "gost_setenv");
 	p_set_log_callback = (fn_set_log_callback)LOAD_SYM(h, "gost_set_log_callback");
 	p_set_log_level = (fn_set_log_level)LOAD_SYM(h, "gost_set_log_level");
 	p_log_level = (fn_log_level)LOAD_SYM(h, "gost_log_level");
@@ -195,8 +213,9 @@ int main(int argc, char **argv) {
 	p_is_running = (fn_is_running)LOAD_SYM(h, "gost_is_running");
 	p_free = (fn_free)LOAD_SYM(h, "gost_free");
 
-	CHECK(p_version && p_set_log_callback && p_set_log_level && p_log_level &&
-	          p_start && p_stop && p_reload && p_is_running && p_free,
+	CHECK(p_version && p_setenv && p_set_log_callback && p_set_log_level &&
+	          p_log_level && p_start && p_stop && p_reload && p_is_running &&
+	          p_free,
 	      "all exported symbols resolved");
 
 	version = p_version();
@@ -205,13 +224,46 @@ int main(int argc, char **argv) {
 
 	CHECK(p_is_running() == 0, "gost_is_running() == 0 before start");
 
+	/*
+	 * gost_setenv must be able to change the environment the Go runtime sees.
+	 *
+	 * This is what an Android host relies on: the c-shared entry point there
+	 * passes an empty envv, so libc setenv is invisible to Go and only the
+	 * runtime's own os.Setenv works. The test drives the certificate directory
+	 * because it is observable end to end: os.UserHomeDir() reads the variable
+	 * through os.Getenv, and x/config/parsing/tls.go persists an auto-generated
+	 * certificate to $HOME/.gost.
+	 */
+	MKDIR("build/smokehome");
+	/* HOME on Unix, USERPROFILE on Windows: os.UserHomeDir picks per GOOS. */
+	rc = p_setenv("HOME", "build/smokehome", &err);
+	CHECK(rc == 0, "gost_setenv(HOME) == 0%s%s", rc ? " err: " : "",
+	      err ? err : "");
+	if (err) {
+		p_free(err);
+		err = NULL;
+	}
+	rc = p_setenv("USERPROFILE", "build/smokehome", &err);
+	CHECK(rc == 0, "gost_setenv(USERPROFILE) == 0%s%s", rc ? " err: " : "",
+	      err ? err : "");
+	if (err) {
+		p_free(err);
+		err = NULL;
+	}
+	remove("build/smokehome/.gost/auto-ca-cert.pem");
+	remove("build/smokehome/.gost/auto-ca-key.pem");
+
 	p_set_log_callback(on_log);
 	p_set_log_level(2); /* info */
 	CHECK(p_log_level() == 2, "gost_log_level() == 2 after set");
 
+	/*
+	 * A TLS listener with no certificate files makes the parser fall back to
+	 * the auto-generated certificate, which is what writes into $HOME/.gost.
+	 */
 	snprintf(cfg, sizeof(cfg),
 	         "{\"services\":[{\"name\":\"s1\",\"addr\":\"127.0.0.1:38080\","
-	         "\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tcp\"}}]}");
+	         "\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tls\"}}]}");
 
 	rc = p_start(cfg, &err);
 	CHECK(rc == 0, "gost_start() == 0%s%s", rc ? " err: " : "",
@@ -223,6 +275,9 @@ int main(int argc, char **argv) {
 	if (rc != 0) {
 		return 1;
 	}
+
+	CHECK(file_exists("build/smokehome/.gost/auto-ca-cert.pem"),
+	      "gost_setenv reached Go: cert persisted under the injected HOME");
 
 	CHECK(wait_for_port(38080, 5000), "socks5 listener is accepting on 38080");
 	CHECK(p_is_running() == 1, "gost_is_running() == 1 after start");

@@ -13,6 +13,8 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"sync"
 	"unsafe"
 
@@ -65,6 +67,52 @@ func gost_version() *C.char {
 		verString = C.CString(engine.Version())
 	})
 	return verString
+}
+
+// gost_setenv sets an environment variable **inside the Go runtime**.
+//
+// The host cannot do this from outside. On Android the c-shared entry point
+// passes an empty environment block — _rt0_<arch>_android_lib hardcodes argc=1
+// and a NULL-terminated empty envv — so goenvs_unix() enumerates zero variables
+// and syscall.envs, the snapshot os.Getenv reads, is permanently empty. Calling
+// libc's setenv from Java/Kotlin writes to bionic's environ, which Go never
+// looks at.
+//
+// That matters because os.TempDir() returns "/data/local/tmp" on Android when
+// TMPDIR is unset (os/file_unix.go), and an app sandbox cannot write there. The
+// engine stages its configuration through os.CreateTemp (engine.go), so every
+// gost_start would fail with "permission denied" unless the host can inject a
+// writable TMPDIR first.
+//
+// Setting HOME matters for the same reason: os.UserHomeDir() falls back to
+// "/sdcard" on Android, which is also unwritable, and x/config/parsing/tls.go
+// persists auto-generated certificates under $HOME/.gost.
+//
+// Call this before gost_start. Returns 0 on success, non-zero on failure, in
+// which case *err receives a message the caller must release with gost_free.
+//
+//export gost_setenv
+func gost_setenv(key, value *C.char, errOut **C.char) (rc C.int) {
+	defer func() {
+		if r := recover(); r != nil {
+			setErr(errOut, panicError(r))
+			rc = 1
+		}
+	}()
+
+	if key == nil || value == nil {
+		setErr(errOut, "gost: setenv: nil key or value")
+		return 1
+	}
+
+	k, v := C.GoString(key), C.GoString(value)
+	if err := os.Setenv(k, v); err != nil {
+		setErr(errOut, fmt.Sprintf("gost: setenv %s: %v", k, err))
+		return 1
+	}
+
+	setErr(errOut, "")
+	return 0
 }
 
 // gost_set_log_callback installs the log sink. Passing NULL removes it.
