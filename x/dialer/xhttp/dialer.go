@@ -84,9 +84,11 @@ func (d *xhttpDialer) Dial(ctx context.Context, addr string, opts ...dialer.Dial
 	}
 
 	host := d.md.host
-	if host == "" {
-		host = options.Host
-	}
+
+	// 不处理options的host，避免后续的tlsConfig.ServerName
+	//if host == "" {
+	//	host = options.Host
+	//}
 
 	var tlsConfig *tls.Config
 	if d.tlsEnabled {
